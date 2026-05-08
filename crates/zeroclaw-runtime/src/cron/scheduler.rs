@@ -136,11 +136,17 @@ async fn catch_up_overdue_jobs(
     tracing::info!("Scheduler startup: catch-up complete");
 }
 
-pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+/// Run a cron job once and return its result.
+///
+/// The third tuple element is `sentinel_fired`: `true` when the agent's raw
+/// response contained the `delivery.suppress_if_contains` sentinel and was
+/// normalized to `"agent job executed"`. Callers that perform their own
+/// delivery (e.g. the REST manual-trigger endpoint, the `cron_run` tool)
+/// should skip the delivery step when this flag is set so manual runs
+/// honor the same suppression policy as scheduled runs.
+pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String, bool) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    let (success, output, _sentinel_fired) =
-        Box::pin(execute_job_with_retry(config, &security, job)).await;
-    (success, output)
+    Box::pin(execute_job_with_retry(config, &security, job)).await
 }
 
 async fn execute_job_with_retry(
