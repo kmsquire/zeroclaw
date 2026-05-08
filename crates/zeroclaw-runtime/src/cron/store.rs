@@ -1009,6 +1009,7 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         to: decl.to.clone(),
         thread_id: decl.thread_id.clone(),
         best_effort: decl.best_effort,
+        suppress_if_contains: decl.suppress_if_contains.clone(),
     }
 }
 

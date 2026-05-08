@@ -504,6 +504,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    if let Some(ref sentinel) = delivery.suppress_if_contains {
+        if output.contains(sentinel.as_str()) {
+            tracing::debug!(job_id = %job.id, "cron delivery suppressed (output contains sentinel)");
+            return Ok(());
+        }
+    }
+
     let channel = delivery
         .channel
         .as_deref()
