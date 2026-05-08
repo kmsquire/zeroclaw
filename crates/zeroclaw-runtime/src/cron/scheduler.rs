@@ -138,32 +138,39 @@ async fn catch_up_overdue_jobs(
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    Box::pin(execute_job_with_retry(config, &security, job)).await
+    let (success, output, _sentinel_fired) =
+        Box::pin(execute_job_with_retry(config, &security, job)).await;
+    (success, output)
 }
 
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> (bool, String, bool) {
     let mut last_output = String::new();
+    let mut last_sentinel_fired = false;
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
-        let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
+        let (success, output, sentinel_fired) = match job.job_type {
+            JobType::Shell => {
+                let (s, o) = run_job_command(config, security, job).await;
+                (s, o, false)
+            }
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
+        last_sentinel_fired = sentinel_fired;
 
         if success {
-            return (true, last_output);
+            return (true, last_output, last_sentinel_fired);
         }
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
+            return (false, last_output, false);
         }
 
         if attempt < retries {
@@ -173,7 +180,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output)
+    (false, last_output, false)
 }
 
 async fn process_due_jobs(
@@ -230,7 +237,8 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let (success, output, sentinel_fired) =
+        Box::pin(execute_job_with_retry(config, security, job)).await;
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
@@ -239,6 +247,7 @@ async fn execute_and_persist_job(
         &output,
         started_at,
         finished_at,
+        sentinel_fired,
     ))
     .await;
 
@@ -249,11 +258,12 @@ async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> (bool, String, bool) {
     if !security.can_act() {
         return (
             false,
             "blocked by security policy: autonomy is read-only".to_string(),
+            false,
         );
     }
 
@@ -261,6 +271,7 @@ async fn run_agent_job(
         return (
             false,
             "blocked by security policy: rate limit exceeded".to_string(),
+            false,
         );
     }
 
@@ -268,6 +279,7 @@ async fn run_agent_job(
         return (
             false,
             "blocked by security policy: action budget exhausted".to_string(),
+            false,
         );
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
@@ -346,14 +358,19 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
+        Ok(response) => {
+            let sentinel_fired = job
+                .delivery
+                .suppress_if_contains
+                .as_deref()
+                .is_some_and(|s| response.contains(s));
+            let output = if response.trim().is_empty() || sentinel_fired {
                 "agent job executed".to_string()
             } else {
                 response
-            },
-        ),
+            };
+            (true, output, sentinel_fired)
+        }
         Err(e) => {
             // Purge memories written during this failed run so they don't
             // pollute future recall and cause context snowball.
@@ -371,7 +388,7 @@ async fn run_agent_job(
             ) {
                 let _ = mem.purge_session(&mem_session_key).await;
             }
-            (false, format!("agent job failed: {e}"))
+            (false, format!("agent job failed: {e}"), false)
         }
     }
 }
@@ -383,12 +400,15 @@ async fn persist_job_result(
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
+    sentinel_fired: bool,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let mut persisted_status = if success { "ok" } else { "error" }.to_string();
     let mut persisted_output = output.to_string();
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
+    if sentinel_fired {
+        tracing::debug!(job_id = %job.id, "cron delivery suppressed (sentinel fired)");
+    } else if let Err(e) = deliver_if_configured(config, job, output).await {
         if job.delivery.best_effort {
             tracing::warn!("Cron delivery failed (best_effort): {e}");
             if success {
@@ -502,13 +522,6 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
-    }
-
-    if let Some(ref sentinel) = delivery.suppress_if_contains {
-        if output.contains(sentinel.as_str()) {
-            tracing::debug!(job_id = %job.id, "cron delivery suppressed (output contains sentinel)");
-            return Ok(());
-        }
     }
 
     let channel = delivery
