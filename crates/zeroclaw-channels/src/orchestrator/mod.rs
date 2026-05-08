@@ -4390,6 +4390,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 )
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_markdown_blocks(sl.use_markdown_blocks)
+                .with_unfurl(sl.unfurl)
                 .with_transcription(config.transcription.clone())
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
                 .with_cancel_reaction(sl.cancel_reaction.clone())
@@ -4895,6 +4896,7 @@ fn collect_configured_channels(
                     .with_strict_mention_in_thread(sl.strict_mention_in_thread)
                     .with_workspace_dir(config.workspace_dir.clone())
                     .with_markdown_blocks(sl.use_markdown_blocks)
+                    .with_unfurl(sl.unfurl)
                     .with_proxy_url(sl.proxy_url.clone())
                     .with_transcription(config.transcription.clone())
                     .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
@@ -6297,7 +6299,9 @@ pub async fn deliver_announcement(
                 sl.channel_ids.clone(),
                 sl.allowed_users.clone(),
             )
-            .with_workspace_dir(config.workspace_dir.clone());
+            .with_workspace_dir(config.workspace_dir.clone())
+            .with_markdown_blocks(sl.use_markdown_blocks)
+            .with_unfurl(sl.unfurl);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         "signal" => {

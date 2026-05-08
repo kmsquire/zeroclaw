@@ -155,7 +155,6 @@ async fn execute_job_with_retry(
     job: &CronJob,
 ) -> (bool, String, bool) {
     let mut last_output = String::new();
-    let mut last_sentinel_fired = false;
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
@@ -168,10 +167,9 @@ async fn execute_job_with_retry(
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
-        last_sentinel_fired = sentinel_fired;
 
         if success {
-            return (true, last_output, last_sentinel_fired);
+            return (true, last_output, sentinel_fired);
         }
 
         if last_output.starts_with("blocked by security policy:") {
