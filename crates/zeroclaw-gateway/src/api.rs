@@ -434,7 +434,7 @@ pub async fn handle_api_cron_run(
     };
 
     let started_at = chrono::Utc::now();
-    let (mut success, output) = zeroclaw_runtime::cron::scheduler::execute_job_now(
+    let (mut success, output, sentinel_fired) = zeroclaw_runtime::cron::scheduler::execute_job_now(
         &config,
         &job,
         Some(state.observer.clone()),
@@ -443,7 +443,8 @@ pub async fn handle_api_cron_run(
     let finished_at = chrono::Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
-    if job.delivery.mode.eq_ignore_ascii_case("announce")
+    if !sentinel_fired
+        && job.delivery.mode.eq_ignore_ascii_case("announce")
         && let (Some(channel), Some(target)) =
             (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
         && let Err(e) = zeroclaw_runtime::cron::scheduler::deliver_announcement(
