@@ -276,6 +276,9 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    if let Some(ref delivery) = patch.delivery {
+        validate_delivery_config(Some(delivery))?;
+    }
     let mut job = get_job(config, job_id)?;
     let mut schedule_changed = false;
 

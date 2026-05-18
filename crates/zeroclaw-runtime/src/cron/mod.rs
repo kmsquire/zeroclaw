@@ -77,6 +77,12 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("delivery.to is required for announce mode");
     }
 
+    if let Some(sentinel) = delivery.suppress_if_contains.as_deref()
+        && sentinel.trim().is_empty()
+    {
+        bail!("delivery.suppress_if_contains must be non-empty when set");
+    }
+
     Ok(())
 }
 
@@ -790,5 +796,52 @@ mod validate_delivery_tests {
         };
         let err = validate_delivery_config(Some(&delivery)).expect_err("unknown channel must fail");
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    fn slack_delivery_with_sentinel(sentinel: Option<&str>) -> DeliveryConfig {
+        DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("slack".into()),
+            to: Some("C123".into()),
+            thread_id: None,
+            best_effort: true,
+            suppress_if_contains: sentinel.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn validate_delivery_accepts_absent_suppress_if_contains() {
+        let delivery = slack_delivery_with_sentinel(None);
+        validate_delivery_config(Some(&delivery))
+            .expect("absent suppress_if_contains must validate");
+    }
+
+    #[test]
+    fn validate_delivery_accepts_nonempty_suppress_if_contains() {
+        let delivery = slack_delivery_with_sentinel(Some("__NO_REPORT__"));
+        validate_delivery_config(Some(&delivery))
+            .expect("non-empty suppress_if_contains must validate");
+    }
+
+    #[test]
+    fn validate_delivery_rejects_empty_suppress_if_contains() {
+        let delivery = slack_delivery_with_sentinel(Some(""));
+        let err = validate_delivery_config(Some(&delivery))
+            .expect_err("empty suppress_if_contains must fail");
+        assert!(
+            err.to_string().contains("suppress_if_contains"),
+            "error message must mention the offending field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_delivery_rejects_whitespace_only_suppress_if_contains() {
+        let delivery = slack_delivery_with_sentinel(Some("   \t  "));
+        let err = validate_delivery_config(Some(&delivery))
+            .expect_err("whitespace-only suppress_if_contains must fail");
+        assert!(
+            err.to_string().contains("suppress_if_contains"),
+            "error message must mention the offending field, got: {err}"
+        );
     }
 }
