@@ -187,8 +187,13 @@ async fn execute_job_with_retry(
     for attempt in 0..=retries {
         let (success, output, sentinel_fired) = match job.job_type {
             JobType::Shell => {
-                let (s, o) = run_job_command(config, security, job).await;
-                (s, o, false)
+                let (success, output) = run_job_command(config, security, job).await;
+                let sentinel_fired = job
+                    .delivery
+                    .suppress_if_contains
+                    .as_deref()
+                    .is_some_and(|s| output.contains(s));
+                (success, output, sentinel_fired)
             }
             JobType::Agent => {
                 Box::pin(run_agent_job(config, security, job, observer.clone())).await
@@ -1081,6 +1086,61 @@ mod tests {
             Box::pin(execute_job_with_retry(&config, &security, &job, None)).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_with_retry_shell_job_suppresses_when_output_contains_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let mut job = test_job("echo __NO_REPORT__");
+        job.delivery.suppress_if_contains = Some("__NO_REPORT__".into());
+
+        let (success, output, sentinel_fired) =
+            Box::pin(execute_job_with_retry(&config, &security, &job, None)).await;
+        assert!(success);
+        assert!(output.contains("__NO_REPORT__"));
+        assert!(
+            sentinel_fired,
+            "shell job whose output contains the sentinel must set sentinel_fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_job_with_retry_shell_job_does_not_suppress_when_output_lacks_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let mut job = test_job("echo all-clear");
+        job.delivery.suppress_if_contains = Some("__NO_REPORT__".into());
+
+        let (success, output, sentinel_fired) =
+            Box::pin(execute_job_with_retry(&config, &security, &job, None)).await;
+        assert!(success);
+        assert!(output.contains("all-clear"));
+        assert!(
+            !sentinel_fired,
+            "shell job whose output lacks the sentinel must not set sentinel_fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_job_with_retry_shell_job_without_sentinel_config_does_not_suppress() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let job = test_job("echo plain-output");
+
+        let (success, _output, sentinel_fired) =
+            Box::pin(execute_job_with_retry(&config, &security, &job, None)).await;
+        assert!(success);
+        assert!(
+            !sentinel_fired,
+            "shell job with no suppress_if_contains configured must never set sentinel_fired"
+        );
     }
 
     #[tokio::test]

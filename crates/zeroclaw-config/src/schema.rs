@@ -6572,8 +6572,12 @@ pub struct DeliveryConfigDecl {
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
-    /// Skip delivery if the job output contains this string. Useful for suppressing
-    /// posts when the agent has nothing to report (e.g. `suppress_if_contains = "__NO_REPORT__"`).
+    /// Optional sentinel substring. When the job's raw output contains this
+    /// string, the configured `announce` delivery is skipped for that run.
+    /// Applies to both shell and agent jobs (e.g. `suppress_if_contains =
+    /// "__NO_REPORT__"`). Must be non-empty when set; empty or whitespace-only
+    /// values are rejected at validation time so a typo cannot silently
+    /// suppress every announcement (`"".contains("")` is always true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppress_if_contains: Option<String>,
 }

@@ -117,7 +117,12 @@ pub struct DeliveryConfig {
     pub thread_id: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
-    /// Skip delivery if the job output contains this string.
+    /// Optional sentinel substring. When the job's raw output contains this
+    /// string, the configured `announce` delivery is skipped for that run.
+    /// Applies to both shell and agent jobs. Must be non-empty when set;
+    /// `validate_delivery_config` rejects empty or whitespace-only values to
+    /// prevent the `"".contains("")` failure mode where every run would be
+    /// suppressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppress_if_contains: Option<String>,
 }
