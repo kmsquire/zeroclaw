@@ -155,6 +155,10 @@ impl Tool for CronUpdateTool {
                                 "best_effort": {
                                     "type": "boolean",
                                     "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
+                                },
+                                "suppress_if_contains": {
+                                    "type": "string",
+                                    "description": "Optional non-empty sentinel substring. When the job's output contains this string, the announce delivery is suppressed for that run. Applies to both shell and agent jobs (e.g. '__NO_REPORT__'). Empty or whitespace-only values are rejected."
                                 }
                             }
                         }
@@ -622,6 +626,85 @@ mod tests {
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             None,
             "empty allowed_tools patch should clear to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_patch_persists_suppress_if_contains() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": {
+                    "delivery": {
+                        "mode": "announce",
+                        "channel": "slack",
+                        "to": "C123",
+                        "suppress_if_contains": "__NO_REPORT__"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(
+            updated.delivery.suppress_if_contains.as_deref(),
+            Some("__NO_REPORT__"),
+            "suppress_if_contains must round-trip through cron_update patch path"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_patch_rejects_empty_suppress_if_contains() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": {
+                    "delivery": {
+                        "mode": "announce",
+                        "channel": "slack",
+                        "to": "C123",
+                        "suppress_if_contains": ""
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "empty suppress_if_contains must be rejected by validation"
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("suppress_if_contains"),
+            "error must mention the offending field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_patch_schema_includes_suppress_if_contains() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+        let delivery_props = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
+            .as_object()
+            .expect("patch.delivery must have properties");
+        assert!(
+            delivery_props.contains_key("suppress_if_contains"),
+            "patch.delivery schema must expose suppress_if_contains"
         );
     }
 

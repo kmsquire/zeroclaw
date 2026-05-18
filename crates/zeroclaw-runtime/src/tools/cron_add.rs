@@ -165,6 +165,10 @@ impl Tool for CronAddTool {
                         "best_effort": {
                             "type": "boolean",
                             "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
+                        },
+                        "suppress_if_contains": {
+                            "type": "string",
+                            "description": "Optional non-empty sentinel substring. When the job's output contains this string, the announce delivery is suppressed for that run. Applies to both shell and agent jobs (e.g. '__NO_REPORT__'). Empty or whitespace-only values are rejected."
                         }
                     }
                 },
@@ -518,6 +522,83 @@ mod tests {
         assert_eq!(jobs[0].delivery.channel.as_deref(), Some("discord"));
         assert_eq!(jobs[0].delivery.to.as_deref(), Some("1234567890"));
         assert!(jobs[0].delivery.best_effort);
+    }
+
+    #[tokio::test]
+    async fn shell_job_persists_suppress_if_contains() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "discord",
+                    "to": "1234567890",
+                    "suppress_if_contains": "__NO_REPORT__"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].delivery.suppress_if_contains.as_deref(),
+            Some("__NO_REPORT__"),
+            "suppress_if_contains must round-trip from tool input to stored job"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_job_rejects_empty_suppress_if_contains() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "discord",
+                    "to": "1234567890",
+                    "suppress_if_contains": ""
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "empty suppress_if_contains must be rejected by validation"
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("suppress_if_contains"),
+            "error must mention the offending field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_suppress_if_contains() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let schema = tool.parameters_schema();
+        let delivery_props = schema["properties"]["delivery"]["properties"]
+            .as_object()
+            .expect("delivery must have properties");
+        assert!(
+            delivery_props.contains_key("suppress_if_contains"),
+            "delivery schema must expose suppress_if_contains so agent-created jobs can configure it"
+        );
     }
 
     #[tokio::test]
