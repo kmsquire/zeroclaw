@@ -447,6 +447,12 @@ pub struct ChannelMessage {
     /// from message text, a reply parent, or room state. `false` means text
     /// or unknown.
     pub voice_origin: bool,
+    /// The sender's own time zone as the channel platform reports it, meant
+    /// to be an IANA name such as `America/Los_Angeles`; `None` when the
+    /// platform reports none. The platform owns this fact and the field only
+    /// carries it per message, unvalidated: consumers must parse it before
+    /// use.
+    pub sender_timezone: Option<String>,
 }
 
 /// Message to send through a channel

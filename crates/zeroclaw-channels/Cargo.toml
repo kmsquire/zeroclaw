@@ -50,6 +50,7 @@ chrono = { version = "0.4", default-features = false, features = [
   "serde",
   "std",
 ] }
+chrono-tz = "0.10"
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = [
   "sink",

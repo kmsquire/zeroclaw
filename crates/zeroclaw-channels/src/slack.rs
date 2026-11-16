@@ -18,9 +18,28 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
-#[derive(Clone)]
-struct CachedSlackDisplayName {
+/// What `users.info` says about a sender: the name shown to the agent and,
+/// when the profile carries one, the sender's IANA time zone (`user.tz`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackSenderProfile {
     display_name: String,
+    timezone: Option<String>,
+}
+
+impl SlackSenderProfile {
+    /// What a sender is known as when `users.info` could not be asked: the
+    /// given name (usually the raw user ID) and no time zone.
+    fn unresolved(display_name: &str) -> Self {
+        Self {
+            display_name: display_name.to_string(),
+            timezone: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedSlackSender {
+    profile: SlackSenderProfile,
     expires_at: Instant,
 }
 
@@ -135,7 +154,7 @@ pub struct SlackChannel {
     mention_only: bool,
     strict_mention_in_thread: bool,
     group_reply_allowed_sender_ids: Vec<String>,
-    user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
+    sender_profile_cache: Mutex<HashMap<String, CachedSlackSender>>,
     workspace_dir: Option<PathBuf>,
     /// Assistant thread targets proven by Slack's assistant lifecycle events.
     /// Assistant threads this process has been told about, with when each was
@@ -474,7 +493,7 @@ impl SlackChannel {
             mention_only: false,
             strict_mention_in_thread: false,
             group_reply_allowed_sender_ids: Vec::new(),
-            user_display_name_cache: Mutex::new(HashMap::new()),
+            sender_profile_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_threads: Mutex::new(HashMap::new()),
             draft_turns: AsyncMutex::new(HashMap::new()),
@@ -1523,24 +1542,40 @@ impl SlackChannel {
         None
     }
 
-    fn cached_sender_display_name(&self, user_id: &str) -> Option<String> {
+    /// The sender's IANA time zone from a `users.info` payload (`user.tz`,
+    /// for example `America/Los_Angeles`). Slack omits it for bots and some
+    /// app users. Passed on as reported; consumers validate it (see
+    /// `ChannelMessage::sender_timezone`).
+    fn extract_user_timezone(payload: &serde_json::Value) -> Option<String> {
+        let tz = payload.get("user")?.get("tz")?.as_str()?.trim();
+        (!tz.is_empty()).then(|| tz.to_string())
+    }
+
+    fn extract_sender_profile(payload: &serde_json::Value) -> Option<SlackSenderProfile> {
+        Some(SlackSenderProfile {
+            display_name: Self::extract_user_display_name(payload)?,
+            timezone: Self::extract_user_timezone(payload),
+        })
+    }
+
+    fn cached_sender_profile(&self, user_id: &str) -> Option<SlackSenderProfile> {
         let now = Instant::now();
-        let Ok(mut cache) = self.user_display_name_cache.lock() else {
+        let Ok(mut cache) = self.sender_profile_cache.lock() else {
             return None;
         };
 
         if let Some(entry) = cache.get(user_id)
             && now <= entry.expires_at
         {
-            return Some(entry.display_name.clone());
+            return Some(entry.profile.clone());
         }
 
         cache.remove(user_id);
         None
     }
 
-    fn cache_sender_display_name(&self, user_id: &str, display_name: &str) {
-        let Ok(mut cache) = self.user_display_name_cache.lock() else {
+    fn cache_sender_profile(&self, user_id: &str, profile: SlackSenderProfile) {
+        let Ok(mut cache) = self.sender_profile_cache.lock() else {
             return;
         };
         if cache.len() >= SLACK_USER_CACHE_MAX_ENTRIES {
@@ -1549,14 +1584,14 @@ impl SlackChannel {
         }
         cache.insert(
             user_id.to_string(),
-            CachedSlackDisplayName {
-                display_name: display_name.to_string(),
+            CachedSlackSender {
+                profile,
                 expires_at: Instant::now() + Self::user_cache_ttl(),
             },
         );
     }
 
-    async fn fetch_sender_display_name(&self, user_id: &str) -> Option<String> {
+    async fn fetch_sender_profile(&self, user_id: &str) -> Option<SlackSenderProfile> {
         let resp = match self
             .http_client()
             .get(self.slack_api_url("users.info"))
@@ -1610,25 +1645,32 @@ impl SlackChannel {
             return None;
         }
 
-        Self::extract_user_display_name(&payload)
+        Self::extract_sender_profile(&payload)
     }
 
-    async fn resolve_sender_identity(&self, user_id: &str) -> String {
+    /// Resolve a sender's display name and time zone, from the cache or one
+    /// `users.info` call. Falls back to the raw user ID and no time zone when
+    /// Slack cannot be asked (for example without the `users:read` scope).
+    async fn resolve_sender_profile(&self, user_id: &str) -> SlackSenderProfile {
         let user_id = user_id.trim();
         if user_id.is_empty() {
-            return String::new();
+            return SlackSenderProfile::unresolved("");
         }
 
-        if let Some(display_name) = self.cached_sender_display_name(user_id) {
-            return display_name;
+        if let Some(profile) = self.cached_sender_profile(user_id) {
+            return profile;
         }
 
-        if let Some(display_name) = self.fetch_sender_display_name(user_id).await {
-            self.cache_sender_display_name(user_id, &display_name);
-            return display_name;
+        if let Some(profile) = self.fetch_sender_profile(user_id).await {
+            self.cache_sender_profile(user_id, profile.clone());
+            return profile;
         }
 
-        user_id.to_string()
+        SlackSenderProfile::unresolved(user_id)
+    }
+
+    async fn resolve_sender_display_name(&self, user_id: &str) -> String {
+        self.resolve_sender_profile(user_id).await.display_name
     }
 
     fn is_group_channel_id(channel_id: &str) -> bool {
@@ -2527,7 +2569,7 @@ impl SlackChannel {
         let sender = if user_id.is_empty() {
             "unknown".to_string()
         } else {
-            self.resolve_sender_identity(user_id).await
+            self.resolve_sender_display_name(user_id).await
         };
 
         let text = message
@@ -4468,7 +4510,7 @@ impl SlackChannel {
                                     // loop cancels the correct in-flight task.
                                     let thread_ts = Some(item_ts.to_string());
                                     let scope_id = Some(item_ts.to_string());
-                                    let sender = self.resolve_sender_identity(user).await;
+                                    let sender = self.resolve_sender_display_name(user).await;
                                     let cancel_msg = ChannelMessage {
                                         id: format!("slack_{item_channel}_{item_ts}_cancel"),
                                         sender,
@@ -4600,11 +4642,15 @@ impl SlackChannel {
                     continue;
                 }
 
-                let sender = self.resolve_sender_identity(user).await;
+                let SlackSenderProfile {
+                    display_name: sender,
+                    timezone: sender_timezone,
+                } = self.resolve_sender_profile(user).await;
 
                 let channel_msg = ChannelMessage {
                     id: format!("slack_{channel_id}_{ts}"),
                     sender,
+                    sender_timezone,
                     reply_target: channel_id.clone(),
                     content: normalized_text,
                     channel: "slack".to_string(),
@@ -6027,7 +6073,10 @@ impl Channel for SlackChannel {
                             continue;
                         };
 
-                        let sender = self.resolve_sender_identity(user).await;
+                        let SlackSenderProfile {
+                            display_name: sender,
+                            timezone: sender_timezone,
+                        } = self.resolve_sender_profile(user).await;
 
                         // Approvals are operator decisions; bot-authored text
                         // must never consume a pending human approval token.
@@ -6050,6 +6099,7 @@ impl Channel for SlackChannel {
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender,
+                            sender_timezone,
                             reply_target: channel_id.clone(),
                             content: normalized_text,
                             channel: "slack".to_string(),
@@ -6146,7 +6196,10 @@ impl Channel for SlackChannel {
                         continue;
                     };
 
-                    let sender = self.resolve_sender_identity(user).await;
+                    let SlackSenderProfile {
+                        display_name: sender,
+                        timezone: sender_timezone,
+                    } = self.resolve_sender_profile(user).await;
 
                     // Approvals are operator decisions; bot-authored text must
                     // never consume a pending human approval token.
@@ -6169,6 +6222,7 @@ impl Channel for SlackChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{thread_channel_id}_{reply_ts}"),
                         sender,
+                        sender_timezone,
                         reply_target: thread_channel_id.clone(),
                         content: normalized_text,
                         channel: "slack".to_string(),
@@ -6761,8 +6815,62 @@ mod tests {
         );
     }
 
+    fn test_sender_profile(display_name: &str, timezone: Option<&str>) -> SlackSenderProfile {
+        SlackSenderProfile {
+            timezone: timezone.map(str::to_string),
+            ..SlackSenderProfile::unresolved(display_name)
+        }
+    }
+
     #[test]
-    fn cached_sender_display_name_returns_none_when_expired() {
+    fn extract_sender_profile_keeps_user_timezone() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "tz": "America/Los_Angeles",
+                "tz_label": "Pacific Standard Time",
+                "tz_offset": -28800,
+                "profile": { "display_name": "Display Name" }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_sender_profile(&payload),
+            Some(test_sender_profile(
+                "Display Name",
+                Some("America/Los_Angeles")
+            ))
+        );
+    }
+
+    #[test]
+    fn extract_sender_profile_without_tz_has_no_timezone() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "tz": "   ",
+                "profile": { "display_name": "Display Name" }
+            }
+        });
+        let no_tz_field = serde_json::json!({
+            "ok": true,
+            "user": { "name": "bot_user" }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_sender_profile(&payload),
+            Some(test_sender_profile("Display Name", None))
+        );
+        assert_eq!(
+            SlackChannel::extract_sender_profile(&no_tz_field),
+            Some(test_sender_profile("bot_user", None))
+        );
+    }
+
+    #[test]
+    fn cached_sender_profile_returns_none_when_expired() {
         let ch = SlackChannel::new(
             unique_test_bot_token(),
             None,
@@ -6771,11 +6879,11 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
         );
         {
-            let mut cache = ch.user_display_name_cache.lock().unwrap();
+            let mut cache = ch.sender_profile_cache.lock().unwrap();
             cache.insert(
                 "U123".to_string(),
-                CachedSlackDisplayName {
-                    display_name: "Expired Name".to_string(),
+                CachedSlackSender {
+                    profile: test_sender_profile("Expired Name", Some("Europe/Berlin")),
                     expires_at: Instant::now()
                         .checked_sub(Duration::from_secs(1))
                         .expect("instant should allow subtracting one second in tests"),
@@ -6783,11 +6891,11 @@ mod tests {
             );
         }
 
-        assert_eq!(ch.cached_sender_display_name("U123"), None);
+        assert_eq!(ch.cached_sender_profile("U123"), None);
     }
 
     #[test]
-    fn cached_sender_display_name_returns_cached_value_when_valid() {
+    fn cached_sender_profile_returns_cached_value_when_valid() {
         let ch = SlackChannel::new(
             unique_test_bot_token(),
             None,
@@ -6795,12 +6903,87 @@ mod tests {
             "slack_test_alias",
             Arc::new(|| vec!["*".into()]),
         );
-        ch.cache_sender_display_name("U123", "Cached Name");
+        ch.cache_sender_profile(
+            "U123",
+            test_sender_profile("Cached Name", Some("Asia/Tokyo")),
+        );
 
         assert_eq!(
-            ch.cached_sender_display_name("U123").as_deref(),
-            Some("Cached Name")
+            ch.cached_sender_profile("U123"),
+            Some(test_sender_profile("Cached Name", Some("Asia/Tokyo")))
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_sender_profile_fetches_tz_once_and_caches_it_with_the_name() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users.info"))
+            .and(query_param("user", "U_TZ"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "user": {
+                    "id": "U_TZ",
+                    "name": "handle",
+                    "tz": "America/Los_Angeles",
+                    "tz_offset": -28800,
+                    "profile": { "display_name": "Pat" }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ch = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        )
+        .with_api_base_url(server.uri());
+
+        let expected = test_sender_profile("Pat", Some("America/Los_Angeles"));
+        assert_eq!(ch.resolve_sender_profile("U_TZ").await, expected);
+        // The second lookup is served from the cache: the mock allows one call.
+        assert_eq!(ch.resolve_sender_profile("U_TZ").await, expected);
+        assert_eq!(ch.resolve_sender_display_name("U_TZ").await, "Pat");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_sender_profile_falls_back_to_user_id_without_timezone_on_missing_scope() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users.info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": "missing_scope"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ch = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        )
+        .with_api_base_url(server.uri());
+
+        assert_eq!(
+            ch.resolve_sender_profile("U_NOSCOPE").await,
+            test_sender_profile("U_NOSCOPE", None)
+        );
+
+        server.verify().await;
     }
 
     #[test]
@@ -9695,6 +9878,25 @@ mod tests {
         history_messages: serde_json::Value,
         peers: Vec<String>,
     ) -> Vec<ChannelMessage> {
+        poll_slack_ingress(
+            auth_test_body,
+            history_messages,
+            serde_json::json!([]),
+            peers,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Same as [`poll_bot_posts_through_ingress_with_peers`], with sender
+    /// profiles already cached, as a prior `users.info` call would leave them.
+    async fn poll_slack_ingress(
+        auth_test_body: serde_json::Value,
+        history_messages: serde_json::Value,
+        thread_replies: serde_json::Value,
+        peers: Vec<String>,
+        sender_profiles: Vec<(&'static str, SlackSenderProfile)>,
+    ) -> Vec<ChannelMessage> {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9712,6 +9914,15 @@ mod tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.replies"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": thread_replies,
+                "has_more": false
+            })))
+            .mount(&server)
+            .await;
 
         let channel = SlackChannel::new(
             unique_test_bot_token(),
@@ -9722,6 +9933,9 @@ mod tests {
         )
         .with_api_base_url(server.uri())
         .with_allow_bot_messages(true);
+        for (user_id, profile) in sender_profiles {
+            channel.cache_sender_profile(user_id, profile);
+        }
 
         let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(8);
         let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
@@ -9757,6 +9971,74 @@ mod tests {
             "test must drive the production polling ingress"
         );
         delivered
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_carries_the_sender_timezone_onto_the_message() {
+        let delivered = poll_slack_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000001",
+                    "user": "U_USER",
+                    "text": "<@U_BOT> what day is it?"
+                }
+            ]),
+            serde_json::json!([]),
+            vec!["*".into()],
+            vec![("U_USER", test_sender_profile("alice", Some("Asia/Tokyo")))],
+        )
+        .await;
+
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|m| (m.sender.as_str(), m.sender_timezone.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("alice", Some("Asia/Tokyo"))],
+            "the users.info time zone must reach the orchestrator with the name"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_thread_replies_carry_the_sender_timezone_onto_the_message() {
+        let delivered = poll_slack_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000001",
+                    "thread_ts": "9999999999.000001",
+                    "reply_count": 1,
+                    "latest_reply": "9999999999.000001",
+                    "user": "U_USER",
+                    "text": "<@U_BOT> start a thread"
+                }
+            ]),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "thread_ts": "9999999999.000001",
+                    "user": "U_OTHER",
+                    "text": "<@U_BOT> what day is it?"
+                }
+            ]),
+            vec!["*".into()],
+            vec![
+                ("U_USER", test_sender_profile("alice", Some("Asia/Tokyo"))),
+                ("U_OTHER", test_sender_profile("bob", Some("Europe/Berlin"))),
+            ],
+        )
+        .await;
+
+        let reply = delivered
+            .iter()
+            .find(|m| m.id.ends_with("_9999999999.000002"))
+            .unwrap_or_else(|| panic!("the thread reply must be delivered: {delivered:?}"));
+        assert_eq!(
+            (reply.sender.as_str(), reply.sender_timezone.as_deref()),
+            ("bob", Some("Europe/Berlin")),
+            "a polled thread reply must carry its own sender's time zone"
+        );
     }
 
     #[tokio::test]
@@ -10007,6 +10289,117 @@ mod tests {
             senders,
             vec!["B_WORKFLOW"],
             "exactly the foreign bot post should reach dispatch"
+        );
+    }
+
+    /// Drive the production Socket Mode loop in `listen`: `apps.connections.open`
+    /// hands out a local websocket, which pushes each envelope and then stays
+    /// open. Collects whatever reaches agent dispatch.
+    async fn socket_mode_ingress(
+        envelopes: Vec<serde_json::Value>,
+        sender_profiles: Vec<(&'static str, SlackSenderProfile)>,
+    ) -> Vec<ChannelMessage> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local websocket listener");
+        let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "user_id": "U_BOT",
+                "bot_id": "B_SELF"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/apps.connections.open"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "url": socket_url })),
+            )
+            .mount(&server)
+            .await;
+        let socket_server = zeroclaw_spawn::spawn!(async move {
+            let (tcp, _) = socket.accept().await.expect("Socket Mode client connects");
+            let mut ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("websocket handshake");
+            for envelope in envelopes {
+                ws.send(WsMessage::Text(envelope.to_string().into()))
+                    .await
+                    .expect("push envelope");
+            }
+            // Read acks until the client goes away, so the loop never sees a
+            // close and reconnects mid-test.
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            Some("xapp-test".into()),
+            vec!["C_ORIGIN".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        )
+        .with_api_base_url(server.uri());
+        for (user_id, profile) in sender_profiles {
+            channel.cache_sender_profile(user_id, profile);
+        }
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(8);
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        let mut delivered = Vec::new();
+        if let Ok(Some(first)) =
+            tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv()).await
+        {
+            delivered.push(first);
+            while let Ok(Some(next)) =
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv()).await
+            {
+                delivered.push(next);
+            }
+        }
+
+        listener.abort();
+        let _ = listener.await;
+        socket_server.abort();
+        let _ = socket_server.await;
+        delivered
+    }
+
+    #[tokio::test]
+    async fn socket_mode_ingress_carries_the_sender_timezone_onto_the_message() {
+        let delivered = socket_mode_ingress(
+            vec![serde_json::json!({
+                "envelope_id": "env-1",
+                "type": "events_api",
+                "payload": {
+                    "event": {
+                        "type": "message",
+                        "channel": "C_ORIGIN",
+                        "user": "U_USER",
+                        "text": "<@U_BOT> what day is it?",
+                        "ts": "1700000000.000100"
+                    }
+                }
+            })],
+            vec![("U_USER", test_sender_profile("alice", Some("Asia/Tokyo")))],
+        )
+        .await;
+
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|m| (m.sender.as_str(), m.sender_timezone.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("alice", Some("Asia/Tokyo"))],
+            "the users.info time zone must reach the orchestrator over Socket Mode"
         );
     }
 
@@ -10319,7 +10712,7 @@ mod tests {
         .with_strict_mention_in_thread(true)
         .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
-        ch.cache_sender_display_name("U_USER", "alice");
+        ch.cache_sender_profile("U_USER", test_sender_profile("alice", None));
 
         let unmentioned = serde_json::json!({
             "ts": "T_IGNORED",
@@ -10411,7 +10804,7 @@ mod tests {
             .with_thread_context_max_messages_resolver(Arc::new(|| 2))
             .with_api_base_url(server.uri()),
         );
-        ch.cache_sender_display_name("U_USER", "alice");
+        ch.cache_sender_profile("U_USER", test_sender_profile("alice", None));
 
         let mention = serde_json::json!({
             "ts": "T_TRIGGER",
@@ -10736,7 +11129,7 @@ mod tests {
         )
         .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
-        ch.cache_sender_display_name("U_USER", "alice");
+        ch.cache_sender_profile("U_USER", test_sender_profile("alice", None));
 
         let mention = serde_json::json!({
             "ts": "T_TRIGGER",
@@ -10815,7 +11208,7 @@ mod tests {
         )
         .with_thread_context_max_messages_resolver(Arc::new(|| 2))
         .with_api_base_url(server.uri());
-        ch.cache_sender_display_name("U_USER", "alice");
+        ch.cache_sender_profile("U_USER", test_sender_profile("alice", None));
 
         let mention = serde_json::json!({
             "ts": "T_TRIGGER",

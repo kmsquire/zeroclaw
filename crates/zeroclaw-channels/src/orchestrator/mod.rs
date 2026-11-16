@@ -2399,12 +2399,22 @@ fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize
 /// `reply_target` / `sender` / delivery hint; this helper removes that
 /// regression.)
 ///
-/// Carries: channel/reply_target/sender/message_id, the wall-clock datetime,
-/// the `cron_add` delivery hint (with the webhook `delivery.thread_id`
-/// contract preserved), and (if set) the bot_mention handle.
+/// Carries: channel/reply_target/sender/message_id, the wall-clock datetime
+/// in the sender's time zone when the channel reported one (see
+/// [`TurnClockZone`]), the `cron_add` delivery hint (with the webhook
+/// `delivery.thread_id` contract preserved), and (if set) the bot_mention
+/// handle.
 fn build_channel_turn_context_preamble(
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
+) -> String {
+    build_channel_turn_context_preamble_at(msg, target_channel, chrono::Utc::now())
+}
+
+fn build_channel_turn_context_preamble_at(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> String {
     if msg.reply_target.is_empty() {
         // CLI-style path: no channel recipient, no need to inject channel
@@ -2412,7 +2422,7 @@ fn build_channel_turn_context_preamble(
         return String::new();
     }
 
-    let now = chrono::Local::now();
+    let clock = TurnClockZone::for_message(msg).at(now);
     let channel_name = msg.channel.as_str();
     let reply_target = msg.reply_target.as_str();
     let sender = msg.sender.as_str();
@@ -2435,7 +2445,7 @@ fn build_channel_turn_context_preamble(
     };
 
     let mut preamble = format!(
-        "[turn-context] time={time} date={date} weekday={weekday} tz={tz} \
+        "[turn-context] time={time} date={date} weekday={weekday} {zone} \
          channel={channel} reply_target={reply_target} sender={sender} \
          message_id={message_id}. The sender field is the platform-specific \
          user ID of the person who sent this message. Use it to distinguish \
@@ -2444,10 +2454,10 @@ fn build_channel_turn_context_preamble(
          the `reaction` tool. When scheduling delayed messages or reminders \
          via cron_add for this conversation, use {delivery_hint} so the \
          message reaches the user.\n\n",
-        time = now.format("%H:%M:%S"),
-        date = now.format("%Y-%m-%d"),
-        weekday = now.format("%A"),
-        tz = now.format("%Z"),
+        time = clock.time,
+        date = clock.date,
+        weekday = clock.weekday,
+        zone = clock.zone_fields(),
         channel = channel_name,
         reply_target = reply_target,
         sender = sender,
@@ -2479,9 +2489,105 @@ fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &st
     parts.join("\n\n")
 }
 
-fn timestamp_channel_user_content(content: &str) -> String {
-    let now = chrono::Local::now();
-    format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
+/// The zone a channel turn's wall clock is rendered in: the sender's own
+/// zone when the channel reported a known IANA name for it
+/// ([`ChannelMessage::sender_timezone`]), otherwise the host's.
+///
+/// [`ChannelMessage::sender_timezone`]: zeroclaw_api::channel::ChannelMessage::sender_timezone
+enum TurnClockZone {
+    Sender(chrono_tz::Tz),
+    Host,
+}
+
+/// One instant rendered in a [`TurnClockZone`]. The preamble and the
+/// stored-turn timestamp both format from here.
+struct TurnClock {
+    time: String,
+    date: String,
+    weekday: String,
+    /// The IANA name of a sender zone. `chrono::Local` has none to report.
+    zone_name: Option<&'static str>,
+    /// The numeric offset in force at this instant, such as `-08:00`.
+    utc_offset: String,
+}
+
+impl TurnClockZone {
+    fn for_message(msg: &zeroclaw_api::channel::ChannelMessage) -> Self {
+        let zone = Self::resolve(msg.sender_timezone.as_deref());
+        if let (Self::Host, Some(name)) = (&zone, msg.sender_timezone.as_deref()) {
+            // The raw value is platform-supplied, so only its length is logged.
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "channel": msg.channel,
+                        "sender_timezone_len": name.len(),
+                    })),
+                "sender time zone is not a known IANA name; using the host zone"
+            );
+        }
+        zone
+    }
+
+    /// An unknown or malformed name falls back to the host zone, so a value a
+    /// platform reports is never echoed into the prompt unless it parses as a
+    /// zone.
+    fn resolve(sender_timezone: Option<&str>) -> Self {
+        sender_timezone
+            .and_then(|name| name.trim().parse::<chrono_tz::Tz>().ok())
+            .map_or(Self::Host, Self::Sender)
+    }
+
+    fn at(&self, now: chrono::DateTime<chrono::Utc>) -> TurnClock {
+        match self {
+            Self::Sender(tz) => TurnClock::new(&now.with_timezone(tz), Some(tz.name())),
+            Self::Host => TurnClock::new(&now.with_timezone(&chrono::Local), None),
+        }
+    }
+}
+
+impl TurnClock {
+    fn new<Tz>(local: &chrono::DateTime<Tz>, zone_name: Option<&'static str>) -> Self
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
+        Self {
+            time: local.format("%H:%M:%S").to_string(),
+            date: local.format("%Y-%m-%d").to_string(),
+            weekday: local.format("%A").to_string(),
+            zone_name,
+            utc_offset: local.format("%:z").to_string(),
+        }
+    }
+
+    /// The preamble's zone fields. A named zone also gets the offset in force,
+    /// so the model need not work out whether daylight saving applies when it
+    /// writes an absolute time; the host zone is its offset alone, as before.
+    fn zone_fields(&self) -> String {
+        match self.zone_name {
+            Some(name) => format!("tz={name} utc_offset={}", self.utc_offset),
+            None => format!("tz={}", self.utc_offset),
+        }
+    }
+}
+
+fn timestamp_channel_user_content(content: &str, zone: &TurnClockZone) -> String {
+    timestamp_channel_user_content_at(content, zone, chrono::Utc::now())
+}
+
+/// Stored turns carry the numeric offset, not `%Z`: for a named zone `%Z` is an
+/// abbreviation, and `CST` alone names at least three zones.
+fn timestamp_channel_user_content_at(
+    content: &str,
+    zone: &TurnClockZone,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let clock = zone.at(now);
+    format!(
+        "[{} {} {}] {}",
+        clock.date, clock.time, clock.utc_offset, content
+    )
 }
 
 fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) -> String {
@@ -2538,7 +2644,8 @@ fn timestamped_channel_user_history_content(
     msg: &zeroclaw_api::channel::ChannelMessage,
     label: &str,
 ) -> String {
-    let timestamped_content = timestamp_channel_user_content(&msg.content);
+    let timestamped_content =
+        timestamp_channel_user_content(&msg.content, &TurnClockZone::for_message(msg));
     attributed_channel_user_turn(msg, label, &timestamped_content)
 }
 
@@ -24512,7 +24619,7 @@ api_key = "anthropic-key"
 
     #[test]
     fn timestamp_channel_user_content_adds_wall_clock_prefix() {
-        let stamped = timestamp_channel_user_content("hello");
+        let stamped = timestamp_channel_user_content("hello", &TurnClockZone::Host);
 
         assert!(
             stamped.starts_with('['),
@@ -48135,6 +48242,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 internal_sop_event: None,
                 references: Vec::new(),
                 voice_origin: false,
+                sender_timezone: None,
             },
             CancellationToken::new(),
         )
@@ -51833,6 +51941,7 @@ This is an example JSON object for profile settings."#;
                 internal_sop_event: None,
                 references: Vec::new(),
                 voice_origin: false,
+                sender_timezone: None,
             },
             CancellationToken::new(),
         )
@@ -57346,6 +57455,168 @@ Done."#;
         assert!(
             !preamble.contains("\"thread_id\""),
             "non-webhook preamble must not emit thread_id: {preamble}"
+        );
+    }
+
+    /// 2026-11-15T07:11:05Z: already Sunday in UTC, still Saturday evening
+    /// on the US west coast.
+    fn late_saturday_pacific() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-15T07:11:05Z")
+            .expect("valid RFC 3339 instant")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn build_channel_turn_context_preamble_renders_clock_in_sender_timezone() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            channel: "slack".into(),
+            reply_target: "D0123".into(),
+            sender: "pat".into(),
+            id: "slack_D0123_1".into(),
+            sender_timezone: Some("America/Los_Angeles".into()),
+            ..Default::default()
+        };
+        let preamble = build_channel_turn_context_preamble_at(&msg, None, late_saturday_pacific());
+
+        assert!(
+            preamble.starts_with(
+                "[turn-context] time=23:11:05 date=2026-11-14 weekday=Saturday \
+                 tz=America/Los_Angeles utc_offset=-08:00 channel=slack "
+            ),
+            "the clock must read the sender's local day, not UTC's: {preamble}"
+        );
+
+        // A second zone, so the test also bites on a host that is itself in
+        // Pacific time.
+        let tokyo = zeroclaw_api::channel::ChannelMessage {
+            sender_timezone: Some("Asia/Tokyo".into()),
+            ..msg
+        };
+        let preamble =
+            build_channel_turn_context_preamble_at(&tokyo, None, late_saturday_pacific());
+        assert!(
+            preamble.starts_with(
+                "[turn-context] time=16:11:05 date=2026-11-15 weekday=Sunday \
+                 tz=Asia/Tokyo utc_offset=+09:00 channel=slack "
+            ),
+            "the clock must follow the sender's zone, not the host's: {preamble}"
+        );
+    }
+
+    #[test]
+    fn build_channel_turn_context_preamble_follows_sender_daylight_saving() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            channel: "slack".into(),
+            reply_target: "D0123".into(),
+            sender: "pat".into(),
+            id: "slack_D0123_2".into(),
+            sender_timezone: Some("America/Los_Angeles".into()),
+            ..Default::default()
+        };
+        let summer = chrono::DateTime::parse_from_rfc3339("2026-07-01T03:00:00Z")
+            .expect("valid RFC 3339 instant")
+            .with_timezone(&chrono::Utc);
+        let preamble = build_channel_turn_context_preamble_at(&msg, None, summer);
+
+        assert!(
+            preamble.contains(
+                "time=20:00:00 date=2026-06-30 weekday=Tuesday \
+                 tz=America/Los_Angeles utc_offset=-07:00 "
+            ),
+            "PDT is UTC-7, so 03:00Z is 20:00 the previous day: {preamble}"
+        );
+
+        // A second zone, so the test also bites on a host that is itself in
+        // Pacific time and would pass the case above by reading its own clock.
+        let berlin = zeroclaw_api::channel::ChannelMessage {
+            sender_timezone: Some("Europe/Berlin".into()),
+            ..msg
+        };
+        let preamble = build_channel_turn_context_preamble_at(&berlin, None, summer);
+        assert!(
+            preamble.contains(
+                "time=05:00:00 date=2026-07-01 weekday=Wednesday \
+                 tz=Europe/Berlin utc_offset=+02:00 "
+            ),
+            "CEST is UTC+2, so 03:00Z is 05:00 the same day: {preamble}"
+        );
+    }
+
+    #[test]
+    fn build_channel_turn_context_preamble_ignores_unknown_sender_timezone() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            channel: "slack".into(),
+            reply_target: "D0123".into(),
+            sender: "pat".into(),
+            id: "slack_D0123_3".into(),
+            sender_timezone: Some("Mars/Olympus_Mons tz=injected".into()),
+            ..Default::default()
+        };
+        let preamble = build_channel_turn_context_preamble_at(&msg, None, late_saturday_pacific());
+
+        assert!(
+            matches!(
+                TurnClockZone::resolve(msg.sender_timezone.as_deref()),
+                TurnClockZone::Host
+            ),
+            "an unknown zone name must fall back to the host zone"
+        );
+        assert!(
+            !preamble.contains("Mars") && !preamble.contains("injected"),
+            "a zone that does not parse must never reach the prompt: {preamble}"
+        );
+        let host = TurnClockZone::Host.at(late_saturday_pacific());
+        assert!(
+            preamble.contains(&format!(
+                "time={} date={} weekday={} tz={} channel=slack ",
+                host.time, host.date, host.weekday, host.utc_offset
+            )),
+            "an unknown zone must render the host clock: {preamble}"
+        );
+    }
+
+    #[test]
+    fn turn_clock_zone_resolves_known_names_and_falls_back_to_host() {
+        assert!(matches!(
+            TurnClockZone::resolve(Some(" Asia/Tokyo ")),
+            TurnClockZone::Sender(chrono_tz::Tz::Asia__Tokyo)
+        ));
+        assert!(matches!(TurnClockZone::resolve(None), TurnClockZone::Host));
+        assert!(matches!(
+            TurnClockZone::resolve(Some("")),
+            TurnClockZone::Host
+        ));
+    }
+
+    #[test]
+    fn timestamp_channel_user_content_uses_sender_timezone() {
+        let zone = TurnClockZone::resolve(Some("Asia/Tokyo"));
+        assert_eq!(
+            timestamp_channel_user_content_at("hello", &zone, late_saturday_pacific()),
+            "[2026-11-15 16:11:05 +09:00] hello"
+        );
+        let zone = TurnClockZone::resolve(Some("America/Los_Angeles"));
+        assert_eq!(
+            timestamp_channel_user_content_at("hello", &zone, late_saturday_pacific()),
+            "[2026-11-14 23:11:05 -08:00] hello"
+        );
+    }
+
+    #[test]
+    fn turn_clock_labels_the_host_zone_with_its_offset_alone() {
+        let clock = TurnClockZone::Host.at(late_saturday_pacific());
+        assert_eq!(clock.zone_fields(), format!("tz={}", clock.utc_offset));
+        let offset = clock.utc_offset.as_bytes();
+        assert!(
+            matches!(offset.len(), 6 | 9)
+                && matches!(offset[0], b'+' | b'-')
+                && offset[3] == b':'
+                && offset
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| matches!(i, 0 | 3 | 6) || b.is_ascii_digit()),
+            "the host offset must read +HH:MM or +HH:MM:SS: {}",
+            clock.utc_offset
         );
     }
 

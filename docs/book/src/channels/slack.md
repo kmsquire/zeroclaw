@@ -25,7 +25,10 @@ the same app page.
 1. In the left sidebar, open **OAuth & Permissions**.
 2. Under **Scopes -> Bot Token Scopes**, add: `app_mentions:read`,
    `channels:history`, `chat:write`, and `channels:read`. (Add `im:history`
-   and `im:write` too if you want direct messages.)
+   and `im:write` too if you want direct messages.) Add `users:read` so the
+   agent sees each sender's display name and reads the date and time in the
+   sender's own time zone; without it the agent sees raw user IDs and the
+   host's clock.
 
 ### 3. Turn on Socket Mode and get the app token
 
