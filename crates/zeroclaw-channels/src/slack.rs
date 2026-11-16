@@ -1559,7 +1559,7 @@ impl SlackChannel {
     async fn fetch_sender_display_name(&self, user_id: &str) -> Option<String> {
         let resp = match self
             .http_client()
-            .get("https://slack.com/api/users.info")
+            .get(self.slack_api_url("users.info"))
             .bearer_auth(&self.bot_token)
             .query(&[("user", user_id)])
             .send()
@@ -4183,7 +4183,7 @@ impl SlackChannel {
 
         let resp = self
             .http_client()
-            .post("https://slack.com/api/apps.connections.open")
+            .post(self.slack_api_url("apps.connections.open"))
             .bearer_auth(app_token)
             .send()
             .await?;
