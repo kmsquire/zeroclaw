@@ -262,13 +262,16 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: deploy-artifact
-      # Signs "this workflow, at this commit of the fork, produced this digest". Before pinning a
-      # checksum, `gh attestation verify --signer-workflow` checks it; a matching .sha256 alone
-      # proves only that the download matches the release. Fails closed, unlike Stable's.
-      - name: Attest the archive
+      # Signs "this workflow, on this branch of the fork, produced these digests". A matching
+      # .sha256 alone proves only that a download matches the release. BUILDINFO is attested too,
+      # because the attestation does not carry the `sha` input: a signed BUILDINFO is what ties the
+      # archive to the commit it was built from. Fails closed, unlike Stable's.
+      - name: Attest the archive and BUILDINFO
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: ${{ needs.build.outputs.asset }}
+          subject-path: |
+            ${{ needs.build.outputs.asset }}
+            BUILDINFO
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
