@@ -1,0 +1,294 @@
+name: Deploy Artifact
+
+# Builds the archive that kmsquire/zeroclaw-oci-terraform installs at boot, for one exact
+# commit, and publishes it as release `build-<sha>` with its SHA-256. Boot then downloads and
+# verifies it instead of compiling for ten minutes: kmsquire/llm-workspace#26.
+#
+# The recipe is upstream's Stable release (release-stable-manual.yml and
+# .github/actions/build-release-payloads at the commit being built): the same web job, the same
+# cross toolchain on ubuntu-22.04 for glibc 2.35, the same bounded ARM64 build memory, and
+# scripts/ci/package_release_archive.sh for the archive layout. One thing differs: the feature
+# set is upstream's `default` selection plus `channel-slack`, where Stable uses `dist`. `dist`
+# has no Slack, Slack is a compiled feature rather than a plugin, and the deployment is
+# Slack-first. That is also exactly what boot used to build: `cargo install --features
+# channel-slack` on top of the defaults.
+#
+# The toolchain defaults to 1.98.1, not Stable's 1.98.0: it is the exact toolchain boot pinned
+# when it still compiled (kmsquire/llm-workspace#66), so the first archive matches the binary it
+# replaces. The builds take the commit's own scripts, so the commit must be v0.9.0 (6c78ba59) or
+# later, or a fork commit on top of one: it needs xtask's `generate features`, `cargo web build`,
+# scripts/ci/dist_runner_memory.sh, scripts/ci/package_release_archive.sh and the
+# ZEROCLAW_BUILD_ID stamp. The asset names and the --version format are a contract with
+# kmsquire/zeroclaw-oci-terraform; its docs/zeroclaw-artifact.md lists what must move together.
+#
+# This file lives on the fork's `deploy` branch, which holds nothing else from upstream, and is
+# dispatched from there: `gh workflow run deploy-artifact.yml --repo kmsquire/zeroclaw --ref
+# deploy -f sha=<sha>`. `master` stays a pure fast-forward mirror of upstream, with upstream's
+# workflows disabled on the fork. The workflow takes nothing from its own ref: every checkout is
+# of the commit being built, so the branch needs no upstream files.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-character commit SHA to build
+        required: true
+        type: string
+      toolchain:
+        description: Exact Rust toolchain to build with; recorded in BUILDINFO
+        required: true
+        default: "1.98.1"
+        type: string
+  # A pull request that edits this file builds upstream v0.9.0 and publishes nothing. That costs
+  # a full cross build, about 20 minutes, and it is the only proof that the recipe still works.
+  pull_request:
+    paths:
+      - .github/workflows/deploy-artifact.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-artifact-${{ inputs.sha || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: aarch64-unknown-linux-gnu
+  EXTRA_FEATURES: channel-slack
+  PR_SHA: 6c78ba59bce6a3d5079cf0c0310488770e264ad4
+  PR_TOOLCHAIN: "1.98.1"
+
+jobs:
+  resolve:
+    name: Resolve inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.inputs.outputs.sha }}
+      toolchain: ${{ steps.inputs.outputs.toolchain }}
+      publish: ${{ steps.inputs.outputs.publish }}
+    steps:
+      - id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          IN_SHA: ${{ inputs.sha }}
+          IN_TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            sha=$IN_SHA toolchain=$IN_TOOLCHAIN publish=true
+          else
+            sha=$PR_SHA toolchain=$PR_TOOLCHAIN publish=false
+          fi
+          if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::sha must be a full 40-character lowercase commit SHA, got '$sha'"
+            exit 1
+          fi
+          if [[ ! $toolchain =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::toolchain must be an exact version such as 1.98.1, got '$toolchain'"
+            exit 1
+          fi
+          # A release is never rebuilt: the archive is not bit-reproducible, so a second build
+          # would no longer match the SHA-256 pinned in variables.tf. Fail before the build.
+          if [ "$publish" = true ] && gh release view "build-$sha" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release build-$sha already exists; delete it first to rebuild, and re-pin its checksum"
+            exit 1
+          fi
+          { echo "sha=$sha"; echo "toolchain=$toolchain"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+
+  web:
+    name: Build web dashboard
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: ${{ needs.resolve.outputs.toolchain }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The xtask wrapper renders the OpenAPI spec, generates the TS client, then runs
+      # npm ci and npm run build. A plain npm build fails on the missing generated client.
+      - run: cargo --locked web build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build aarch64-unknown-linux-gnu
+    needs: [resolve, web]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    outputs:
+      asset: ${{ steps.package.outputs.asset }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    env:
+      SHA: ${{ needs.resolve.outputs.sha }}
+      TOOLCHAIN: ${{ needs.resolve.outputs.toolchain }}
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      # Stamps `zeroclaw --version` with the full commit, which the reprovision post-check
+      # compares against the pin. See crates/zeroclaw-buildinfo.
+      ZEROCLAW_BUILD_ID: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: ${{ needs.resolve.outputs.toolchain }}
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: deploy-ubuntu-22.04-aarch64-unknown-linux-gnu
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Install cross compiler and qemu
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user
+
+      - name: Prepare bounded Linux ARM64 build memory
+        id: dist_memory
+        timeout-minutes: 5
+        run: bash scripts/ci/dist_runner_memory.sh prepare
+
+      # No --target: the generator defines per-target exclusions for distribution selections
+      # only, and refuses the flag for `default`. aarch64-unknown-linux-gnu has none in any case
+      # (Cargo.toml, [package.metadata.zeroclaw.dist_target_exclusions]).
+      - name: Resolve features
+        id: features
+        run: |
+          base="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection default)"
+          features="$base,$EXTRA_FEATURES"
+          echo "Resolved features: $features"
+          echo "features=$features" >> "$GITHUB_OUTPUT"
+
+      # As build-release-payloads does: --no-default-features against the generator's explicit
+      # list, two jobs to stay inside the runner's memory. zerocode and zerorelay are left out;
+      # the deployment runs neither, and the packager treats them as optional.
+      - name: Build
+        env:
+          FEATURES: ${{ steps.features.outputs.features }}
+        run: cargo build --release --locked --jobs 2 --no-default-features --features "$FEATURES" --target "$TARGET"
+
+      - name: Check the binary under qemu
+        run: |
+          bin="target/$TARGET/release/zeroclaw"
+          run() { HOME="$RUNNER_TEMP/zc-home" qemu-aarch64 -L /usr/aarch64-linux-gnu "$bin" "$@"; }
+          mkdir -p "$RUNNER_TEMP/zc-home"
+          version="$(run --version)"
+          echo "$version"
+          case $version in
+            *"($SHA)"*) ;;
+            *) echo "::error::--version does not carry $SHA"; exit 1 ;;
+          esac
+          channels="$(run channel list 2>&1)" || { echo "$channels"; echo "::error::channel list failed"; exit 1; }
+          echo "$channels"
+          if ! grep -qE '[[:space:]]Slack$' <<<"$channels"; then
+            echo "::error::Slack is not among the compiled channels"
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        env:
+          FEATURES: ${{ steps.features.outputs.features }}
+        run: |
+          bash scripts/ci/package_release_archive.sh "$TARGET" zeroclaw tar.gz "$RUNNER_OS"
+          asset="zeroclaw-$TARGET-$SHA.tar.gz"
+          # Provenance goes beside the archive, not into it, so the archive keeps upstream's
+          # exact layout. The release notes carry the same lines.
+          printf 'commit=%s\ntoolchain=%s\ntarget=%s\nfeatures=%s\nrun=%s/%s/actions/runs/%s\n' \
+            "$SHA" "$TOOLCHAIN" "$TARGET" "$FEATURES" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > BUILDINFO
+          mv "zeroclaw-$TARGET.tar.gz" "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          cat BUILDINFO "$asset.sha256"
+          {
+            echo "asset=$asset"
+            echo "sha256=$(cut -d' ' -f1 "$asset.sha256")"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '```'
+            cat BUILDINFO "$asset.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deploy-artifact
+          path: |
+            zeroclaw-aarch64-unknown-linux-gnu-*.tar.gz*
+            BUILDINFO
+          retention-days: 14
+
+      - name: Report and release owned Linux ARM64 build memory
+        timeout-minutes: 5
+        if: always()
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
+        run: bash scripts/ci/dist_runner_memory.sh cleanup
+
+  publish:
+    name: Publish release build-${{ needs.resolve.outputs.sha }}
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
+    # The `release` environment admits only the `deploy` branch, so a dispatch from any other
+    # branch can build but not publish. Every attestation then names this file on `deploy`.
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-artifact
+      # Signs "this workflow, at this commit of the fork, produced this digest". Before pinning a
+      # checksum, `gh attestation verify --signer-workflow` checks it; a matching .sha256 alone
+      # proves only that the download matches the release. Fails closed, unlike Stable's.
+      - name: Attest the archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ needs.build.outputs.asset }}
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          ASSET: ${{ needs.build.outputs.asset }}
+          WANT: ${{ needs.build.outputs.sha256 }}
+        run: |
+          echo "$WANT  $ASSET" | sha256sum -c -
+          {
+            echo "Deployment build of $SHA for kmsquire/zeroclaw-oci-terraform. Not a ZeroClaw release."
+            echo
+            echo '```'
+            cat BUILDINFO "$ASSET.sha256"
+            echo '```'
+          } > notes.md
+          # --latest=false: these are pinned by commit, and none of them is "the" release.
+          # The tag points at this workflow's own commit, not at $SHA. A tag on an upstream commit
+          # brings in .github/workflows files no ref of the fork has, and GitHub refuses that ref
+          # to GITHUB_TOKEN (HTTP 403). The built commit is in the tag name, the asset name and
+          # BUILDINFO, which is where boot and the post-checks read it.
+          gh release create "build-$SHA" "$ASSET" "$ASSET.sha256" BUILDINFO \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Deployment build ${SHA:0:12}" --notes-file notes.md --latest=false
