@@ -155,10 +155,13 @@ jobs:
         timeout-minutes: 5
         run: bash scripts/ci/dist_runner_memory.sh prepare
 
+      # No --target: the generator defines per-target exclusions for distribution selections
+      # only, and refuses the flag for `default`. aarch64-unknown-linux-gnu has none in any case
+      # (Cargo.toml, [package.metadata.zeroclaw.dist_target_exclusions]).
       - name: Resolve features
         id: features
         run: |
-          base="$(cargo run --quiet -p xtask --bin generate -- features --selection default --target "$TARGET")"
+          base="$(cargo run --quiet -p xtask --bin generate -- features --selection default)"
           features="$base,$EXTRA_FEATURES"
           echo "Resolved features: $features"
           echo "features=$features" >> "$GITHUB_OUTPUT"
