@@ -13,8 +13,13 @@ name: Deploy Artifact
 # Slack-first. That is also exactly what boot used to build: `cargo install --features
 # channel-slack` on top of the defaults.
 #
-# This workflow lives on the fork's default branch and builds whatever commit it is given, so
-# a later upstream release, or a fork commit carrying a local patch, needs no change here.
+# The toolchain defaults to 1.98.1, not Stable's 1.98.0: it is the exact toolchain boot pinned
+# when it still compiled (kmsquire/llm-workspace#66), so the first archive matches the binary it
+# replaces. The builds take the commit's own scripts, so the commit must be v0.9.0 (6c78ba59) or
+# later, or a fork commit on top of one: it needs xtask's `generate features`, `cargo web build`,
+# scripts/ci/dist_runner_memory.sh, scripts/ci/package_release_archive.sh and the
+# ZEROCLAW_BUILD_ID stamp. The asset names and the --version format are a contract with
+# kmsquire/zeroclaw-oci-terraform; its docs/zeroclaw-artifact.md lists what must move together.
 
 on:
   workflow_dispatch:
@@ -24,11 +29,12 @@ on:
         required: true
         type: string
       toolchain:
-        description: Exact Rust toolchain, recorded in the archive's BUILDINFO
+        description: Exact Rust toolchain to build with; recorded in BUILDINFO
         required: true
         default: "1.98.1"
         type: string
-  # A pull request that edits this file builds upstream v0.9.0 and publishes nothing.
+  # A pull request that edits this file builds upstream v0.9.0 and publishes nothing. That costs
+  # a full cross build, about an hour, and it is the only proof that the recipe still works.
   pull_request:
     paths:
       - .github/workflows/deploy-artifact.yml
@@ -106,7 +112,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       # The xtask wrapper renders the OpenAPI spec, generates the TS client, then runs
       # npm ci and npm run build. A plain npm build fails on the missing generated client.
-      - run: cargo web build
+      - run: cargo --locked web build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: web-dist
@@ -161,7 +167,7 @@ jobs:
       - name: Resolve features
         id: features
         run: |
-          base="$(cargo run --quiet -p xtask --bin generate -- features --selection default)"
+          base="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection default)"
           features="$base,$EXTRA_FEATURES"
           echo "Resolved features: $features"
           echo "features=$features" >> "$GITHUB_OUTPUT"
@@ -185,7 +191,7 @@ jobs:
             *"($SHA)"*) ;;
             *) echo "::error::--version does not carry $SHA"; exit 1 ;;
           esac
-          channels="$(run channel list 2>&1)" || { echo "$channels"; exit 1; }
+          channels="$(run channel list 2>&1)" || { echo "$channels"; echo "::error::channel list failed"; exit 1; }
           echo "$channels"
           if ! grep -qE '[[:space:]]Slack$' <<<"$channels"; then
             echo "::error::Slack is not among the compiled channels"
@@ -241,10 +247,19 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: deploy-artifact
+      # Signs "this workflow, at this commit of the fork, produced this digest". Before pinning a
+      # checksum, `gh attestation verify --signer-workflow` checks it; a matching .sha256 alone
+      # proves only that the download matches the release. Fails closed, unlike Stable's.
+      - name: Attest the archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ needs.build.outputs.asset }}
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
