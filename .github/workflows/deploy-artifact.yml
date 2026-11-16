@@ -276,6 +276,10 @@ jobs:
             echo '```'
           } > notes.md
           # --latest=false: these are pinned by commit, and none of them is "the" release.
+          # The tag points at this workflow's own commit, not at $SHA. A tag on an upstream commit
+          # brings in .github/workflows files no ref of the fork has, and GitHub refuses that ref
+          # to GITHUB_TOKEN (HTTP 403). The built commit is in the tag name, the asset name and
+          # BUILDINFO, which is where boot and the post-checks read it.
           gh release create "build-$SHA" "$ASSET" "$ASSET.sha256" BUILDINFO \
-            --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Deployment build ${SHA:0:12}" --notes-file notes.md --latest=false
