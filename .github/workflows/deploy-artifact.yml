@@ -34,7 +34,7 @@ on:
         default: "1.98.1"
         type: string
   # A pull request that edits this file builds upstream v0.9.0 and publishes nothing. That costs
-  # a full cross build, about an hour, and it is the only proof that the recipe still works.
+  # a full cross build, about 20 minutes, and it is the only proof that the recipe still works.
   pull_request:
     paths:
       - .github/workflows/deploy-artifact.yml
