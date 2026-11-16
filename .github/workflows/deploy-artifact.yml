@@ -259,6 +259,12 @@ jobs:
       # Signs "this workflow, at this commit of the fork, produced this digest". Before pinning a
       # checksum, `gh attestation verify --signer-workflow` checks it; a matching .sha256 alone
       # proves only that the download matches the release. Fails closed, unlike Stable's.
+      # Negative control for the release environment (kmsquire/llm-workspace#26): this branch must
+      # be refused at the job's start. If it is admitted, stop here rather than publish anything.
+      - name: Refuse to publish from this branch
+        run: |
+          echo "::error::the release environment admitted $GITHUB_REF; it must admit only deploy"
+          exit 1
       - name: Attest the archive
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
