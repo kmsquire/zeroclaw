@@ -11,6 +11,8 @@ pub mod mqtt;
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
 pub use crate::amqp::AmqpChannel;
+#[cfg(feature = "channel-bluebubbles")]
+pub use crate::bluebubbles::BlueBubblesChannel;
 #[cfg(feature = "channel-bluesky")]
 pub use crate::bluesky::BlueskyChannel;
 #[cfg(feature = "channel-clawdtalk")]
@@ -2127,6 +2129,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "bluebubbles" => Some(
+            "When responding on iMessage:\n\
+             - Write plain text. iMessage does not render Markdown, so do not use **bold**, # headers, tables, or [label](url) links.\n\
+             - Leave bare URLs unwrapped; iMessage links them automatically.\n\
+             - Keep replies short; they are often read on a phone or a watch.\n",
         ),
         "signal" => Some(
             "When responding on Signal:\n\
@@ -13174,7 +13182,7 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            linq, email, gmail_push, git, irc, twitter, mochat, imessage, bluebubbles, line, voice-call"
         )
     }
 }
@@ -13408,6 +13416,25 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-signal"))]
         "signal" => {
             anyhow::bail!("Signal channel requires the `channel-signal` feature");
+        }
+        #[cfg(feature = "channel-bluebubbles")]
+        "bluebubbles" => {
+            let bb = config
+                .channels
+                .bluebubbles
+                .get("default")
+                .context("BlueBubbles channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("bluebubbles", &alias))
+            };
+            Ok(Arc::new(BlueBubblesChannel::new(alias, bb, peer_resolver)?))
+        }
+        #[cfg(not(feature = "channel-bluebubbles"))]
+        "bluebubbles" => {
+            anyhow::bail!("BlueBubbles channel requires the `channel-bluebubbles` feature");
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -14655,6 +14682,47 @@ fn live_external_peer_resolver(
     Arc::new(move || config.read().channel_external_peers(channel_type, &alias))
 }
 
+/// Enabled BlueBubbles aliases that would answer the same conversation as
+/// another alias on the same server. Each alias polls the whole server and is
+/// bound to one agent, so an overlap would send one conversation to two
+/// agents; both aliases are refused instead, and the conflict is logged.
+#[cfg(feature = "channel-bluebubbles")]
+fn bluebubbles_conflicting_aliases(
+    config: &Config,
+    is_active: impl Fn(&str) -> bool,
+) -> std::collections::HashSet<String> {
+    let aliases: Vec<crate::bluebubbles::AliasPeers<'_>> = config
+        .channels
+        .bluebubbles
+        .iter()
+        .filter(|(alias, bb)| bb.enabled && is_active(alias))
+        .map(|(alias, bb)| crate::bluebubbles::AliasPeers {
+            alias: alias.as_str(),
+            server_url: bb.server_url.as_str(),
+            peers: config.channel_external_peers("bluebubbles", alias),
+            group_chat_guids: &bb.group_chat_guids,
+        })
+        .collect();
+    let overlaps = crate::bluebubbles::find_overlaps(&aliases);
+    for o in &overlaps {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            &format!(
+                "BlueBubbles aliases '{}' and '{}' on the same server would both answer the same \
+                 conversation ({}); neither is started. Make their peer groups and \
+                 group_chat_guids disjoint.",
+                o.first, o.second, o.what
+            )
+        );
+    }
+    overlaps
+        .into_iter()
+        .flat_map(|o| [o.first, o.second])
+        .collect()
+}
+
 /// Build the Matrix channel for `[channels.matrix.<alias>]` with every
 /// live-config resolver installed, mirroring
 /// [`build_configured_discord_channel`].
@@ -15166,6 +15234,67 @@ fn collect_configured_channels_with_authority(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Signal channel is configured but this build was compiled without \
              `channel-signal`; skipping Signal."
+        );
+    }
+
+    #[cfg(feature = "channel-bluebubbles")]
+    let bluebubbles_conflicted = bluebubbles_conflicting_aliases(&config, |alias| {
+        active_channel_aliases.contains(&format!("bluebubbles.{alias}"))
+    });
+    #[cfg(feature = "channel-bluebubbles")]
+    for (alias, bb) in &config.channels.bluebubbles {
+        if !active_channel_aliases.contains(&format!("bluebubbles.{alias}")) {
+            continue;
+        }
+        if !bb.enabled || bluebubbles_conflicted.contains(alias) {
+            continue;
+        }
+        if !bb.has_required_credentials() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "BlueBubbles channel '{alias}' is enabled but missing required fields \
+                     (channels.bluebubbles.{alias}.server_url, \
+                     channels.bluebubbles.{alias}.password); skipping it."
+                )
+            );
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("bluebubbles", &alias))
+        };
+        match BlueBubblesChannel::new(alias.clone(), bb, peer_resolver) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "BlueBubbles",
+                alias: Some(alias.clone()),
+                channel: crate::paced_channel::PacedChannel::wrap(
+                    Arc::new(channel.with_workspace_dir(
+                        config.channel_workspace_dir(&format!("bluebubbles.{alias}")),
+                    )),
+                    bb,
+                ),
+            }),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                &format!("BlueBubbles channel '{alias}' could not be built: {e}")
+            ),
+        }
+    }
+
+    #[cfg(not(feature = "channel-bluebubbles"))]
+    if !config.channels.bluebubbles.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "BlueBubbles channel is configured but this build was compiled without \
+             `channel-bluebubbles`; skipping BlueBubbles."
         );
     }
 
@@ -18046,6 +18175,23 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-signal"))]
         "signal" => {
             anyhow::bail!("Signal channel requires the `channel-signal` feature");
+        }
+        #[cfg(feature = "channel-bluebubbles")]
+        "bluebubbles" => {
+            let bb = config
+                .channels
+                .bluebubbles
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("bluebubbles", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = BlueBubblesChannel::new(alias, bb, peer_resolver)?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-bluebubbles"))]
+        "bluebubbles" => {
+            anyhow::bail!("BlueBubbles channel requires the `channel-bluebubbles` feature");
         }
         #[cfg(feature = "channel-wechat")]
         "wechat" => {
