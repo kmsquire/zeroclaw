@@ -8,10 +8,12 @@ name: Deploy Artifact
 # .github/actions/build-release-payloads at the commit being built): the same web job, the same
 # cross toolchain on ubuntu-22.04 for glibc 2.35, the same bounded ARM64 build memory, and
 # scripts/ci/package_release_archive.sh for the archive layout. One thing differs: the feature
-# set is upstream's `default` selection plus `channel-slack`, where Stable uses `dist`. `dist`
-# has no Slack, Slack is a compiled feature rather than a plugin, and the deployment is
-# Slack-first. That is also exactly what boot used to build: `cargo install --features
-# channel-slack` on top of the defaults.
+# set is upstream's `default` selection plus `channel-slack` and `channel-bluebubbles`, where
+# Stable uses `dist`. `dist` has no Slack, Slack is a compiled feature rather than a plugin, and
+# the deployment is Slack-first. That is also what boot used to build: `cargo install --features
+# channel-slack` on top of the defaults. BlueBubbles is the family's iMessage channel
+# (kmsquire/llm-workspace#135), which exists only on the carry branch from afd89c996 on, so this
+# workflow no longer builds an older commit.
 #
 # The toolchain defaults to 1.98.1, not Stable's 1.98.0: it is the exact toolchain boot pinned
 # when it still compiled (kmsquire/llm-workspace#66), so the first archive matches the binary it
@@ -39,7 +41,7 @@ on:
         required: true
         default: "1.98.1"
         type: string
-  # A pull request that edits this file builds upstream v0.9.0 and publishes nothing. That costs
+  # A pull request that edits this file builds PR_SHA and publishes nothing. That costs
   # a full cross build, about 20 minutes, and it is the only proof that the recipe still works.
   pull_request:
     paths:
@@ -55,8 +57,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   TARGET: aarch64-unknown-linux-gnu
-  EXTRA_FEATURES: channel-slack
-  PR_SHA: 6c78ba59bce6a3d5079cf0c0310488770e264ad4
+  EXTRA_FEATURES: channel-slack,channel-bluebubbles
+  PR_SHA: afd89c9963a79523bf2fceb760bdea24816a4aa2
   PR_TOOLCHAIN: "1.98.1"
 
 jobs:
@@ -199,10 +201,12 @@ jobs:
           esac
           channels="$(run channel list 2>&1)" || { echo "$channels"; echo "::error::channel list failed"; exit 1; }
           echo "$channels"
-          if ! grep -qE '[[:space:]]Slack$' <<<"$channels"; then
-            echo "::error::Slack is not among the compiled channels"
-            exit 1
-          fi
+          for want in Slack BlueBubbles; do
+            if ! grep -qE "[[:space:]]$want\$" <<<"$channels"; then
+              echo "::error::$want is not among the compiled channels"
+              exit 1
+            fi
+          done
 
       - name: Package
         id: package
