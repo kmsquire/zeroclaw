@@ -39,6 +39,9 @@ const MAX_WINDOWS_PER_POLL: usize = 40;
 /// to its chat is stored a moment after the message itself.
 const OVERLAP_ROWS: i64 = 50;
 
+/// How many unlisted groups are named in the log, once each.
+const MAX_REPORTED_GROUPS: usize = 64;
+
 /// Longest single iMessage this channel sends. Longer replies are split on
 /// paragraph boundaries; long messages read badly on a watch.
 const MAX_MESSAGE_CHARS: usize = 2000;
@@ -301,7 +304,7 @@ impl BlueBubblesChannel {
                     scan
                 };
                 first = false;
-                let hi = scan + WINDOW_ROWS;
+                let hi = scan.saturating_add(WINDOW_ROWS);
                 let rows = self.fetch_window(lo, hi, cur).await?;
                 let top = rows.iter().filter_map(PolledRow::rowid).max();
                 for row in rows {
@@ -362,6 +365,18 @@ impl BlueBubblesChannel {
         cur: &cursor::Cursor,
     ) -> anyhow::Result<Vec<PolledRow>> {
         let mut rows = self.api.messages_in_window(lo, hi).await?;
+        // The server is trusted to apply the window, but not relied on: one
+        // that ignored it would hand back the newest rows on every query,
+        // and they would be answered again each time.
+        let asked = rows.len();
+        rows.retain(|r| r.rowid().is_some_and(|id| id > lo && id <= hi));
+        if rows.len() < asked {
+            self.note(
+                Level::Warn,
+                "BlueBubbles returned rows outside the requested window; ignoring them",
+                serde_json::json!({"outside": asked - rows.len(), "lo": lo, "hi": hi}),
+            );
+        }
         rows.retain(|r| match r {
             PolledRow::Message(m) => !cur.seen(&m.guid),
             PolledRow::Unreadable { rowid, .. } => rowid.is_some_and(|r| r > cur.rowid),
@@ -461,7 +476,10 @@ impl BlueBubblesChannel {
 
     fn report_drop(&self, rowid: i64, reason: &DropReason) {
         if let DropReason::UnlistedGroup(guid) = reason {
-            if self.reported_groups.lock().insert(guid.clone()) {
+            // Anyone can add the bot to a group, so the set is capped.
+            let mut reported = self.reported_groups.lock();
+            if reported.len() < MAX_REPORTED_GROUPS && reported.insert(guid.clone()) {
+                drop(reported);
                 self.note(
                     Level::Info,
                     "BlueBubbles message from a group chat this alias does not answer in; \

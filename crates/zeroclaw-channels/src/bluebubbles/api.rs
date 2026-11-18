@@ -27,6 +27,12 @@ pub(crate) const QUERY_ROW_LIMIT: u32 = 1000;
 /// Longest error-body excerpt kept for a log line.
 const ERROR_BODY_EXCERPT_CHARS: usize = 200;
 
+/// The most of a response body read: a broken or hostile server could
+/// otherwise stream without end inside the timeout. A query of 1,000 rows
+/// with their chats is well under a megabyte.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+
 const REDACTED: &str = "[REDACTED]";
 
 /// A message as returned by `POST /api/v1/message/query`. Only the fields
@@ -97,6 +103,9 @@ impl PolledRow {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub(crate) struct BbHandle {
     pub address: String,
+    /// `iMessage` or `SMS`.
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -220,6 +229,37 @@ impl BlueBubblesApi {
         Ok(url)
     }
 
+    /// Up to `cap` bytes of a body; an error past that.
+    async fn body(
+        &self,
+        what: &str,
+        mut resp: reqwest::Response,
+        cap: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        if resp.content_length().is_some_and(|n| n > cap as u64) {
+            anyhow::bail!("{what}: response larger than {cap} bytes");
+        }
+        let mut out = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| self.transport_error(what, e))?
+        {
+            if out.len() + chunk.len() > cap {
+                anyhow::bail!("{what}: response larger than {cap} bytes");
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    /// A JSON body of at most `MAX_BODY_BYTES`.
+    async fn json_body(&self, what: &str, resp: reqwest::Response) -> anyhow::Result<Value> {
+        let bytes = self.body(what, resp, MAX_BODY_BYTES).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::Error::msg(format!("{what}: bad JSON ({:?})", e.classify())))
+    }
+
     fn transport_error(&self, what: &str, e: reqwest::Error) -> anyhow::Error {
         let e = e.without_url();
         // reqwest's own message is generic ("error sending request"); the
@@ -234,23 +274,14 @@ impl BlueBubblesApi {
         anyhow::Error::msg(format!("{what}: {}", self.redact(&detail)))
     }
 
+    /// A failed request's status and a redacted excerpt of its body. Not for
+    /// sends, whose body echoes the message: see `send_error`.
     async fn status_error(&self, what: &str, resp: reqwest::Response) -> anyhow::Error {
-        self.status_error_without(what, resp, &[]).await
-    }
-
-    /// Like `status_error`, also removing `private` strings (a chat's handle,
-    /// the message text) that BlueBubbles echoes in a failed send's error.
-    async fn status_error_without(
-        &self,
-        what: &str,
-        resp: reqwest::Response,
-        private: &[&str],
-    ) -> anyhow::Error {
         let status = resp.status();
-        let mut body = resp.text().await.unwrap_or_default();
-        for value in private.iter().filter(|v| !v.trim().is_empty()) {
-            body = body.replace(value, REDACTED);
-        }
+        let body = match self.body(what, resp, MAX_ERROR_BODY_BYTES).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => String::new(),
+        };
         // Redact before cutting, so a cut can never leave part of the
         // password behind where the redaction no longer recognizes it.
         let excerpt: String = self
@@ -260,6 +291,50 @@ impl BlueBubblesApi {
             .take(ERROR_BODY_EXCERPT_CHARS)
             .collect();
         anyhow::Error::msg(format!("{what}: HTTP {status}: {excerpt}"))
+    }
+
+    /// A failed send's error. BlueBubbles' body echoes the message and the
+    /// chat, in forms (escaped, cut) a redaction can miss, so none of it is
+    /// kept: only the status, the error's type, and AppleScript error numbers
+    /// such as -1743, the missing Automation permission.
+    async fn send_error(&self, resp: reqwest::Response) -> anyhow::Error {
+        let status = resp.status();
+        let body = self
+            .body("BlueBubbles send failed", resp, MAX_ERROR_BODY_BYTES)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let kind = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|t| {
+                t.len() <= 40
+                    && t.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
+            });
+        let codes: Vec<&str> = body
+            .split('(')
+            .skip(1)
+            .filter_map(|s| s.split_once(')').map(|(code, _)| code))
+            .filter(|c| {
+                c.len() <= 6
+                    && c.starts_with('-')
+                    && c[1..].chars().all(|d| d.is_ascii_digit())
+                    && c.len() > 1
+            })
+            .collect();
+        let mut detail = format!("BlueBubbles send failed: HTTP {status}");
+        if let Some(kind) = kind {
+            detail.push_str(&format!(": {kind}"));
+        }
+        if !codes.is_empty() {
+            detail.push_str(&format!(" (AppleScript error {})", codes.join(", ")));
+        }
+        anyhow::Error::msg(detail)
     }
 
     /// `GET /api/v1/server/info`: the server is up and the password is right.
@@ -296,10 +371,7 @@ impl BlueBubblesApi {
                 .status_error("BlueBubbles message lookup failed", resp)
                 .await);
         }
-        let envelope: Value = resp
-            .json()
-            .await
-            .map_err(|e| self.transport_error("BlueBubbles message lookup returned bad JSON", e))?;
+        let envelope = self.json_body("BlueBubbles message lookup", resp).await?;
         Ok(envelope
             .pointer("/data/isFromMe")
             .and_then(Value::as_bool)
@@ -361,19 +433,14 @@ impl BlueBubblesApi {
             }
         };
         if !resp.status().is_success() {
-            let handle = chat_guid.rsplit(';').next().unwrap_or_default();
-            return Err(SendError::Other(
-                self.status_error_without(
-                    "BlueBubbles send failed",
-                    resp,
-                    &[text, chat_guid, handle],
-                )
-                .await,
-            ));
+            return Err(SendError::Other(self.send_error(resp).await));
         }
         // The sent message's GUID, when the server reports one, lets a later
         // inline reply to it be recognized as a reply to the bot.
-        let envelope: Value = resp.json().await.unwrap_or(Value::Null);
+        let envelope = self
+            .json_body("BlueBubbles send reply", resp)
+            .await
+            .unwrap_or(Value::Null);
         Ok(envelope
             .pointer("/data/guid")
             .and_then(Value::as_str)
@@ -394,10 +461,7 @@ impl BlueBubblesApi {
                 .status_error("BlueBubbles message query failed", resp)
                 .await);
         }
-        let envelope: Value = resp
-            .json()
-            .await
-            .map_err(|e| self.transport_error("BlueBubbles message query returned bad JSON", e))?;
+        let envelope = self.json_body("BlueBubbles message query", resp).await?;
         let data = envelope
             .get("data")
             .cloned()
@@ -431,7 +495,9 @@ impl BlueBubblesApi {
         .await
     }
 
-    /// Whether any row exists above `rowid`.
+    /// Whether any row exists above `rowid`. The row IDs are checked rather
+    /// than trusting the `where`, so a server that ignored it can't keep a
+    /// scan climbing.
     pub(crate) async fn any_after(&self, rowid: i64) -> anyhow::Result<bool> {
         let rows = self
             .query(json!({
@@ -440,7 +506,7 @@ impl BlueBubblesApi {
                 "with": ["chat"],
             }))
             .await?;
-        Ok(!rows.is_empty())
+        Ok(rows.iter().any(|r| r.rowid().is_some_and(|id| id > rowid)))
     }
 
     /// The highest row ID among the most recent messages (`None` on an empty
@@ -502,9 +568,11 @@ impl BlueBubblesApi {
 pub(crate) fn parse_row(row: &Value) -> PolledRow {
     match serde_json::from_value::<BbMessage>(row.clone()) {
         Ok(m) => PolledRow::Message(Box::new(m)),
+        // Serde's message quotes the offending value, which can be message
+        // text, so only its category is kept.
         Err(e) => PolledRow::Unreadable {
             rowid: row.get("originalROWID").and_then(Value::as_i64),
-            error: e.to_string(),
+            error: format!("{:?}", e.classify()),
         },
     }
 }

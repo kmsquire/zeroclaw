@@ -53,6 +53,9 @@ pub(crate) enum DropReason {
     NoSender,
     UnknownSender,
     UnlistedGroup(String),
+    /// SMS, RCS, or a service this channel doesn't know. Carries nothing:
+    /// an SMS chat's GUID holds the sender's number.
+    NotIMessage,
 }
 
 impl DropReason {
@@ -66,6 +69,7 @@ impl DropReason {
             DropReason::NoSender => "no_sender",
             DropReason::UnknownSender => "unknown_sender",
             DropReason::UnlistedGroup(_) => "unlisted_group",
+            DropReason::NotIMessage => "not_imessage",
         }
     }
 }
@@ -127,6 +131,19 @@ pub(crate) fn chat_kind(chat_guid: &str) -> Option<ChatKind> {
         "-" => Some(ChatKind::Direct),
         "+" => Some(ChatKind::Group),
         _ => None,
+    }
+}
+
+/// Whether a message came over iMessage, the only service whose sender
+/// Apple vouches for. An SMS sender's number can be forged, and with Text
+/// Message Forwarding on, the Mac receives SMS too. The chat GUID's first
+/// field is the service; newer macOS writes `any` there, and then only the
+/// sender's handle can say.
+pub(crate) fn is_imessage(chat_guid: &str, handle_service: Option<&str>) -> bool {
+    match chat_guid.split(';').next() {
+        Some("iMessage") => handle_service.is_none_or(|s| s == "iMessage"),
+        Some("any") => handle_service == Some("iMessage"),
+        _ => false,
     }
 }
 
@@ -294,6 +311,10 @@ pub(crate) fn classify(
     let Some(kind) = chat_kind(&chat.guid) else {
         return Disposition::Drop(DropReason::NoChat);
     };
+    let service = m.handle.as_ref().and_then(|h| h.service.as_deref());
+    if !is_imessage(&chat.guid, service) {
+        return Disposition::Drop(DropReason::NotIMessage);
+    }
     let text = m.text.as_deref().map(str::trim).unwrap_or_default();
     if text.is_empty() {
         return Disposition::Drop(DropReason::Empty);

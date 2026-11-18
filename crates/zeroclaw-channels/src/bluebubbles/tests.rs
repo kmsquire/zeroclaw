@@ -331,6 +331,56 @@ fn an_alias_with_no_or_empty_peer_group_admits_nobody() {
 }
 
 #[test]
+fn only_imessage_is_admitted_since_an_sms_sender_can_be_forged() {
+    let sms_dm = "SMS;-;+15551230001";
+    let sms_group = "SMS;+;chat100";
+    // A peer's number, over SMS: dropped, in a DM and in a group, however it
+    // is addressed and whatever the handle says.
+    for v in [
+        row(1, sms_dm, Some(KID), "hi"),
+        row(2, sms_dm, None, "hi"),
+        row(3, sms_group, Some(KID), "Early, hi"),
+        row(4, "RCS;-;+15551230001", Some(KID), "hi"),
+        with(
+            row(5, DM, Some(KID), "hi"),
+            "handle",
+            json!({"address": KID, "service": "SMS"}),
+        ),
+        with(
+            row(6, "any;-;+15551230001", Some(KID), "hi"),
+            "handle",
+            json!({"address": KID, "service": "SMS"}),
+        ),
+        row(7, "any;-;+15551230001", Some(KID), "hi"),
+    ] {
+        assert_eq!(
+            classify(&v, CatchUp::Live, false),
+            Disposition::Drop(DropReason::NotIMessage),
+            "{v}"
+        );
+    }
+    // The same sender over iMessage, and an `any` chat whose handle says
+    // iMessage, start a turn.
+    for v in [
+        row(8, DM, Some(KID), "hi"),
+        with(
+            row(9, DM, Some(KID), "hi"),
+            "handle",
+            json!({"address": KID, "service": "iMessage"}),
+        ),
+        with(
+            row(10, "any;-;+15551230001", Some(KID), "hi"),
+            "handle",
+            json!({"address": KID, "service": "iMessage"}),
+        ),
+    ] {
+        assert_eq!(kind(&classify(&v, CatchUp::Live, false)), "turn", "{v}");
+    }
+    // The reason names no number: an SMS chat's GUID holds one.
+    assert_eq!(DropReason::NotIMessage.as_str(), "not_imessage");
+}
+
+#[test]
 fn a_dm_from_someone_not_in_the_peers_is_dropped() {
     let d = classify(
         &row(1, "iMessage;-;+15559990000", Some(STRANGER), "hi"),
@@ -1046,6 +1096,132 @@ async fn polling_moves_past_dropped_and_unreadable_rows_and_gaps() {
     assert_eq!(cur.rowid, 2_000);
 }
 
+/// A server that ignores the query's `where` and `limit` and answers every
+/// query with the same rows.
+struct IgnoresWindow(Vec<Value>);
+
+impl Respond for IgnoresWindow {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"status": 200, "data": self.0}))
+    }
+}
+
+#[tokio::test]
+async fn a_server_that_ignores_the_window_gets_each_row_handed_off_once() {
+    let pw = test_password();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/message/query"))
+        .respond_with(IgnoresWindow(vec![
+            row(1, DM, Some(KID), "one"),
+            row(2, DM, Some(KID), "two"),
+            row(900, DM, Some(KID), "nine hundred"),
+        ]))
+        .mount(&server)
+        .await;
+    let ch = channel(&server.uri(), &pw);
+    let (tx, mut rx) = mpsc::channel(100);
+    let mut cur = saved(0);
+    tokio::time::timeout(Duration::from_secs(10), ch.poll_once(&tx, &mut cur, true))
+        .await
+        .expect("the scan ends")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ch.poll_once(&tx, &mut cur, true))
+        .await
+        .expect("the scan ends")
+        .unwrap();
+    drop(tx);
+    let mut got = Vec::new();
+    while let Some(m) = rx.recv().await {
+        got.push(m.content);
+    }
+    assert_eq!(got, ["one", "two", "nine hundred"]);
+    assert_eq!(cur.rowid, 900);
+}
+
+#[tokio::test]
+async fn rows_below_the_window_are_not_handed_off_again() {
+    let pw = test_password();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/message/query"))
+        .respond_with(IgnoresWindow(vec![
+            row(1, DM, Some(KID), "one"),
+            row(2, DM, Some(KID), "two"),
+        ]))
+        .mount(&server)
+        .await;
+    let ch = channel(&server.uri(), &pw);
+    let (tx, mut rx) = mpsc::channel(100);
+    // Long past these rows, and no longer remembering their GUIDs.
+    let mut cur = saved(5_000);
+    tokio::time::timeout(Duration::from_secs(10), ch.poll_once(&tx, &mut cur, true))
+        .await
+        .expect("the scan ends")
+        .unwrap();
+    drop(tx);
+    assert!(rx.recv().await.is_none(), "an old row was handed off again");
+}
+
+#[tokio::test]
+async fn a_response_past_the_size_cap_is_an_error_not_a_crash() {
+    let pw = test_password();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/message/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(17 * 1024 * 1024)))
+        .mount(&server)
+        .await;
+    let ch = channel(&server.uri(), &pw);
+    let (tx, _rx) = mpsc::channel(10);
+    let mut cur = saved(0);
+    let err = ch.poll_once(&tx, &mut cur, true).await.unwrap_err();
+    assert!(format!("{err:#}").contains("larger than"), "{err:#}");
+}
+
+#[test]
+fn an_unreadable_row_keeps_no_text_from_it() {
+    let row = json!({"originalROWID": 5, "guid": "g", "text": "secret plans", "isFromMe": "secret plans"});
+    match api::parse_row(&row) {
+        PolledRow::Unreadable { rowid, error } => {
+            assert_eq!(rowid, Some(5));
+            assert!(!error.contains("secret"), "{error}");
+        }
+        PolledRow::Message(_) => panic!("should not parse"),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_send_keeps_only_the_status_type_and_applescript_error() {
+    let pw = test_password();
+    let server = MockServer::start().await;
+    // The message JSON-escaped, which a plain replace of the text would miss.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/message/text"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "status": 500,
+            "error": {"type": "Server Error",
+                      "message": "osascript: send \"plans\nfor Friday\" to participant +15551230001 (-1743)"}
+        })))
+        .mount(&server)
+        .await;
+    let ch = channel(&server.uri(), &pw);
+    let err = ch
+        .send(&SendMessage::new("\"plans\"\nfor Friday", DM))
+        .await
+        .unwrap_err();
+    let shown = format!("{err:#}");
+    assert!(
+        !shown.contains("plans") && !shown.contains("Friday"),
+        "message leaked: {shown}"
+    );
+    assert!(!shown.contains("5551230001"), "handle leaked: {shown}");
+    assert!(
+        shown.contains("Server Error") && shown.contains("-1743"),
+        "{shown}"
+    );
+}
+
 #[tokio::test]
 async fn a_row_seen_late_below_the_cursor_is_handed_off_once() {
     let pw = test_password();
@@ -1461,6 +1637,33 @@ fn the_listener_reports_pending_then_tracks_poll_results() {
     assert_eq!(ch.listener_health(), Some(ListenerHealth::Unhealthy));
     ch.record_success();
     assert_eq!(ch.listener_health(), Some(ListenerHealth::Healthy));
+}
+
+#[tokio::test]
+async fn pacing_keeps_who_the_channel_is() {
+    let pw = test_password();
+    let cfg = BlueBubblesConfig {
+        reply_min_interval_secs: 1,
+        ..config("http://127.0.0.1:9", &pw)
+    };
+    let inner: Arc<dyn Channel> = Arc::new(channel("http://127.0.0.1:9", &pw));
+    let paced = crate::paced_channel::PacedChannel::wrap(inner.clone(), &cfg);
+    assert!(
+        !Arc::ptr_eq(&paced, &inner),
+        "pacing should wrap the channel"
+    );
+    let dm = zeroclaw_api::channel::ChannelMessage::new("1", KID, DM, "hi", "bluebubbles", 0);
+    let group =
+        zeroclaw_api::channel::ChannelMessage::new("2", KID, FAMILY_GROUP, "hi", "bluebubbles", 0);
+    assert_eq!(paced.self_handle(), inner.self_handle());
+    assert_eq!(paced.self_handle().as_deref(), Some(BOT));
+    assert_eq!(
+        paced.self_addressed_mention(),
+        inner.self_addressed_mention()
+    );
+    assert!(paced.self_addressed_mention().is_some());
+    assert!(paced.is_direct_message(&dm));
+    assert!(!paced.is_direct_message(&group));
 }
 
 #[test]
