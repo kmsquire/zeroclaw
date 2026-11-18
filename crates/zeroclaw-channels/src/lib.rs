@@ -34,6 +34,8 @@ pub mod voice;
 // Feature-gated channels
 #[cfg(feature = "channel-amqp")]
 pub mod amqp;
+#[cfg(feature = "channel-bluebubbles")]
+pub mod bluebubbles;
 #[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
 #[cfg(feature = "channel-clawdtalk")]

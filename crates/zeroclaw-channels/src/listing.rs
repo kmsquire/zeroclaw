@@ -54,6 +54,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-signal"),
     },
     ChannelCompileSpec {
+        schema_name: Some("BlueBubbles"),
+        type_keys: &["bluebubbles"],
+        compiled: cfg!(feature = "channel-bluebubbles"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("WhatsApp"),
         type_keys: &["whatsapp"],
         compiled: cfg!(feature = "channel-whatsapp-cloud"),

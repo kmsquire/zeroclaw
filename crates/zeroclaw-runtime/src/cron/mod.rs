@@ -52,6 +52,7 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "dingtalk",
     "wechat",
     "signal",
+    "bluebubbles",
     "email",
 ];
 

@@ -16343,6 +16343,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub signal: HashMap<String, SignalConfig>,
+    /// BlueBubbles (iMessage) channel instances (`[channels.bluebubbles.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub bluebubbles: HashMap<String, BlueBubblesConfig>,
     /// WhatsApp channel instances (`[channels.whatsapp.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16565,6 +16569,13 @@ impl ChannelsConfig {
                 configured: !self.signal.is_empty(),
             },
             ChannelInfo {
+                kind: "bluebubbles",
+                config_key: "bluebubbles",
+                name: "BlueBubbles",
+                desc: "iMessage through a BlueBubbles server",
+                configured: !self.bluebubbles.is_empty(),
+            },
+            ChannelInfo {
                 kind: "whatsapp",
                 config_key: "whatsapp",
                 name: "WhatsApp",
@@ -16784,6 +16795,7 @@ impl ChannelsConfig {
             || self.imessage.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
             || self.signal.values().any(|c| c.enabled)
+            || self.bluebubbles.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
@@ -16821,7 +16833,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -16831,6 +16843,7 @@ impl ChannelsConfig {
             ("imessage", !self.imessage.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
             ("signal", !self.signal.is_empty(), true),
+            ("bluebubbles", !self.bluebubbles.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
@@ -16917,6 +16930,7 @@ impl Default for ChannelsConfig {
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
+            bluebubbles: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             nextcloud_talk: HashMap::new(),
@@ -18466,6 +18480,121 @@ impl ChannelConfig for SignalConfig {
     }
 }
 
+/// BlueBubbles channel configuration: iMessage through a BlueBubbles server
+/// reached over HTTP. Inbound messages are polled from the server's message
+/// database; nothing listens on this host.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.bluebubbles"]
+pub struct BlueBubblesConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the BlueBubbles server (e.g. `"http://mac.example:1234"`).
+    #[tab(Connection)]
+    pub server_url: String,
+    /// BlueBubbles server password. The server only accepts it as a URL query
+    /// parameter, so every request URL carries it and is treated as secret.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub password: String,
+    /// The bot's own handles (phone numbers and Apple ID emails). Messages
+    /// from these are the bot's own and never start a turn.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub self_handles: Vec<String>,
+    /// Group chat GUIDs (`iMessage;+;chat...`) this alias answers in. Group
+    /// chats not listed here are ignored. Direct messages are governed by the
+    /// alias's peer groups alone.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub group_chat_guids: Vec<String>,
+    /// Names that address the bot in a group chat. A group message starts a
+    /// turn only when it begins with one of these followed by `,` or `:`,
+    /// contains `@name` or `hey name`, or replies to one of the bot's own
+    /// messages. Empty means only replies address the bot.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub mention_names: Vec<String>,
+    /// Seconds between polls of the server for new messages. Default: `3`;
+    /// `0` is treated as `1`.
+    #[tab(Advanced)]
+    #[serde(default = "default_bluebubbles_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds.
+    /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
+}
+
+fn default_bluebubbles_poll_interval_secs() -> u64 {
+    3
+}
+
+impl Default for BlueBubblesConfig {
+    /// Built by deserializing an object supplying only the two fields with no
+    /// serde default, so the serde defaults stay the single source of truth
+    /// for everything else.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"server_url":"","password":""}"#)
+            .expect("every other BlueBubblesConfig field declares a serde default")
+    }
+}
+
+impl BlueBubblesConfig {
+    /// Whether both required credentials (`server_url`, `password`) are set.
+    /// The orchestrator skips an enabled alias without them rather than
+    /// building a listener that can never authenticate.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.server_url)
+            && !crate::traits::is_unset_display_value(&self.password)
+    }
+
+    /// Reject an enabled alias with an empty `server_url` or `password` at
+    /// config-load time, before its listener crashloops.
+    pub fn validate_required(&self, alias: &str) -> Result<()> {
+        let enabled_path = format!("channels.bluebubbles.{alias}.enabled");
+        validate_required_field(
+            &format!("channels.bluebubbles.{alias}.server_url"),
+            &enabled_path,
+            self.enabled,
+            &self.server_url,
+        )?;
+        validate_required_field(
+            &format!("channels.bluebubbles.{alias}.password"),
+            &enabled_path,
+            self.enabled,
+            &self.password,
+        )
+    }
+}
+
+impl ChannelConfig for BlueBubblesConfig {
+    fn name() -> &'static str {
+        "BlueBubbles"
+    }
+    fn desc() -> &'static str {
+        "iMessage through a BlueBubbles server"
+    }
+}
+
 /// WhatsApp Web usage mode.
 ///
 /// The mode no longer decides WHETHER the chat policies apply. `dm_policy` and
@@ -18786,6 +18915,7 @@ impl_reply_pacing!(
     IMessageConfig,
     MatrixConfig,
     SignalConfig,
+    BlueBubblesConfig,
     WhatsAppConfig,
 );
 
@@ -24522,6 +24652,7 @@ impl Config {
             .chain(rows("imessage", &c.imessage))
             .chain(rows("matrix", &c.matrix))
             .chain(rows("signal", &c.signal))
+            .chain(rows("bluebubbles", &c.bluebubbles))
             .chain(rows("whatsapp", &c.whatsapp))
             .collect()
     }
@@ -24868,6 +24999,10 @@ impl Config {
         // reject at config-load time instead.
         for (alias, sig) in &self.channels.signal {
             sig.validate_required(alias)?;
+        }
+
+        for (alias, bb) in &self.channels.bluebubbles {
+            bb.validate_required(alias)?;
         }
 
         for (alias, vc) in &self.channels.voice_call {
@@ -34983,6 +35118,7 @@ auto_save = true
                 imessage: HashMap::new(),
                 matrix: HashMap::new(),
                 signal: HashMap::new(),
+                bluebubbles: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
@@ -37406,6 +37542,7 @@ allowed_users = ["@u:matrix.org"]
                 },
             )]),
             signal: HashMap::new(),
+            bluebubbles: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
             nextcloud_talk: HashMap::new(),
@@ -37995,6 +38132,7 @@ allowed_numbers = ["+1", "+2"]
             imessage: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
+            bluebubbles: HashMap::new(),
             whatsapp: HashMap::from([(
                 "default".to_string(),
                 WhatsAppConfig {
@@ -51562,6 +51700,14 @@ allowed_users = []
     /// Rust default fails here instead of reaching an operator.
     #[test]
     async fn channel_rust_default_matches_serde_default() {
+        assert_eq!(
+            serde_json::to_value(BlueBubblesConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<BlueBubblesConfig>(r#"{"server_url":"","password":""}"#)
+                    .unwrap()
+            )
+            .unwrap()
+        );
         assert_eq!(
             serde_json::to_value(DiscordConfig::default()).unwrap(),
             serde_json::to_value(serde_json::from_str::<DiscordConfig>("{}").unwrap()).unwrap()

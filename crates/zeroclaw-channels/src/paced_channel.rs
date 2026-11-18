@@ -365,6 +365,22 @@ impl Channel for PacedChannel {
         self.inner.listener_health()
     }
 
+    /// Forward who the channel is. Without these the trait defaults answer
+    /// for the wrapper once pacing is on: the self-loop guard sees no handle
+    /// of its own, every DM reads as not direct, and the mention drops out of
+    /// the system prompt.
+    fn self_handle(&self) -> Option<String> {
+        self.inner.self_handle()
+    }
+
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.inner.self_addressed_mention()
+    }
+
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        self.inner.is_direct_message(msg)
+    }
+
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         self.inner.start_typing(recipient).await
     }

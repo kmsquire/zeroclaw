@@ -86,6 +86,8 @@ pub enum ChannelKind {
     AcpChannel,
     #[strum(serialize = "amqp")]
     Amqp,
+    #[strum(serialize = "bluebubbles")]
+    BlueBubbles,
     Bluesky,
     #[strum(serialize = "clawdtalk")]
     ClawdTalk,
