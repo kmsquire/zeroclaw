@@ -4,6 +4,7 @@
 //! catch-up plan, so every admission rule is testable without a server.
 
 use super::api::BbMessage;
+use super::people::People;
 use std::collections::{HashMap, HashSet};
 use zeroclaw_api::channel::{ChannelConversationScope, ChannelMessage};
 
@@ -27,9 +28,29 @@ pub(crate) struct AliasPolicy<'a> {
     /// Names that address the bot in a group chat.
     pub mention_names: &'a [String],
     /// The alias's resolved peer list, as configured (may hold `*` and
-    /// `!handle` deny markers).
+    /// `!handle` deny markers). Ignored when `people` is set.
     pub peers: &'a [String],
+    /// The alias's people map, when it has `people_command`. Then admission
+    /// is "the sender's handle is in the map", and every message handed on
+    /// names the person, never the handle (kmsquire/llm-workspace#181).
+    pub people: Option<&'a People>,
 }
+
+/// `sender` for someone in a listed group chat who isn't in the people map.
+/// It starts with `~`, which no person ID can, so it never names someone.
+pub(crate) const UNKNOWN_SENDER: &str = "~unknown";
+
+/// How a message's sender is admitted.
+enum Admission<'a> {
+    /// No people map: the alias's configured peers decide.
+    Peers,
+    /// A people map: the person the handle belongs to, or `None`.
+    Map(Option<&'a str>),
+}
+
+/// The `reply_target` prefix for a person's one-to-one chat. The channel
+/// turns it back into a chat GUID only when it sends.
+pub(crate) const DM_PREFIX: &str = "dm:";
 
 /// How a message relates to a stretch of downtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +170,7 @@ pub(crate) fn is_imessage(chat_guid: &str, handle_service: Option<&str>) -> bool
 
 /// The handle in a one-to-one chat GUID, used when a message carries no
 /// handle of its own. Never taken from a group GUID.
-fn direct_chat_handle(chat_guid: &str) -> Option<&str> {
+pub(crate) fn direct_chat_handle(chat_guid: &str) -> Option<&str> {
     let mut parts = chat_guid.splitn(3, ';');
     let _service = parts.next()?;
     (parts.next()? == "-").then_some(())?;
@@ -327,9 +348,18 @@ pub(crate) fn classify(
         },
         _ => return Disposition::Drop(DropReason::NoSender),
     };
-    let admitted = crate::allowlist::is_user_allowed_by(policy.peers, &sender, |peer, user| {
-        normalize_handle(peer) == normalize_handle(user)
-    });
+    let admission = match policy.people {
+        Some(people) => Admission::Map(people.by_handle(&sender).map(|p| p.id.as_str())),
+        None => Admission::Peers,
+    };
+    let admitted = match admission {
+        Admission::Map(person) => person.is_some(),
+        Admission::Peers => {
+            crate::allowlist::is_user_allowed_by(policy.peers, &sender, |peer, user| {
+                normalize_handle(peer) == normalize_handle(user)
+            })
+        }
+    };
 
     let (scope, addressed) = match kind {
         ChatKind::Direct => {
@@ -353,10 +383,24 @@ pub(crate) fn classify(
     let timestamp_secs = m
         .date_created
         .map_or(0, |ms| u64::try_from(ms / 1000).unwrap_or(0));
+    // What leaves the channel. With a people map, never a handle: the
+    // person's ID, and for a one-to-one chat (whose GUID holds the handle) a
+    // `dm:` token that the channel resolves again only when it sends.
+    let (sender, reply_target) = match admission {
+        Admission::Peers => (sender, chat.guid.clone()),
+        Admission::Map(person) => {
+            let who = person.unwrap_or(UNKNOWN_SENDER).to_string();
+            let target = match kind {
+                ChatKind::Direct => format!("{DM_PREFIX}{who}"),
+                ChatKind::Group => chat.guid.clone(),
+            };
+            (who, target)
+        }
+    };
     let mut msg = ChannelMessage::new(
         m.guid.clone(),
         sender.clone(),
-        chat.guid.clone(),
+        reply_target,
         text.to_string(),
         CHANNEL_NAME,
         timestamp_secs,

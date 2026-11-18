@@ -1,0 +1,263 @@
+{
+ "_about": "Shared test vectors for the family handle map (llm-workspace#181). Every implementation that reads the map runs these: scripts/store-family-handles.py here, zeroclaw-family-handles in zeroclaw-oci-terraform, and the BlueBubbles channel in kmsquire/zeroclaw. Copies must match this file byte for byte. Every handle is made up (555-01xx, example.com). `ok` is the only shared answer; each implementation words its own errors, never with a handle in them.",
+ "vectors": [
+  {
+   "name": "a good map",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}}}",
+   "ok": true
+  },
+  {
+   "name": "an adult with no handles and no preferred handle",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}, \"test-adult\": {\"role\": \"adult\", \"handles\": []}}}",
+   "ok": true
+  },
+  {
+   "name": "unknown keys are ignored",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}, \"test-adult\": {\"role\": \"adult\", \"handles\": [\"+15550100003\"], \"preferred\": \"+15550100003\", \"note\": \"x\"}}, \"version_note\": \"x\"}",
+   "ok": true
+  },
+  {
+   "name": "an international number",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}, \"test-adult\": {\"role\": \"adult\", \"handles\": [\"+442079460000\"], \"preferred\": \"+442079460000\"}}}",
+   "ok": true
+  },
+  {
+   "name": "no preferred handle",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\"]}}}",
+   "ok": false
+  },
+  {
+   "name": "a preferred handle that isn't theirs",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\"], \"preferred\": \"+15550100001\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a preferred handle but no handles",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [], \"preferred\": \"+15550100002\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a preferred handle that isn't a string",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\"], \"preferred\": 15550100002}}}",
+   "ok": false
+  },
+  {
+   "name": "two owners",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"owner\", \"handles\": [\"+15550100002\"], \"preferred\": \"+15550100002\"}}}",
+   "ok": false
+  },
+  {
+   "name": "no owner",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"adult\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}}}",
+   "ok": false
+  },
+  {
+   "name": "one handle shared by two people",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}}}",
+   "ok": false
+  },
+  {
+   "name": "an email with capitals",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"Kid@example.com\"], \"preferred\": \"Kid@example.com\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a phone number without +",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"15550100002\"], \"preferred\": \"15550100002\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a phone number with punctuation",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+1 555 010 0002\"], \"preferred\": \"+1 555 010 0002\"}}}",
+   "ok": false
+  },
+  {
+   "name": "an email with ..",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"a..b@example.com\"], \"preferred\": \"a..b@example.com\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a quote in an email",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"a\\\"b@example.com\"], \"preferred\": \"a\\\"b@example.com\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a bad role",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"kid\", \"handles\": [\"+15550100002\"], \"preferred\": \"+15550100002\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a person id with capitals",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}, \"Test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100003\"], \"preferred\": \"+15550100003\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a person id with a space",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}, \"test kid2\": {\"role\": \"child\", \"handles\": [\"+15550100003\"], \"preferred\": \"+15550100003\"}}}",
+   "ok": false
+  },
+  {
+   "name": "no people",
+   "text": "{\"people\": {}}",
+   "ok": false
+  },
+  {
+   "name": "people isn't an object",
+   "text": "{\"people\": [\"test-owner\"]}",
+   "ok": false
+  },
+  {
+   "name": "a person isn't an object",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": \"child\"}}",
+   "ok": false
+  },
+  {
+   "name": "handles isn't a list",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": \"+15550100002\", \"preferred\": \"+15550100002\"}}}",
+   "ok": false
+  },
+  {
+   "name": "a handle that isn't a string",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [15550100002], \"preferred\": 15550100002}}}",
+   "ok": false
+  },
+  {
+   "name": "the top level isn't an object",
+   "text": "[{\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+15550100002\", \"kid@example.com\"], \"preferred\": \"kid@example.com\"}}]",
+   "ok": false
+  },
+  {
+   "name": "a duplicate key, valid whichever copy wins",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}}}",
+   "ok": false
+  },
+  {
+   "name": "not JSON",
+   "text": "{\"people\": ",
+   "ok": false
+  },
+  {
+   "name": "empty",
+   "text": "",
+   "ok": false
+  },
+  {
+   "name": "full-width digits",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+1５５５０１００１０２\"], \"preferred\": \"+1５５５０１００１０２\"}}}",
+   "ok": false
+  },
+  {
+   "name": "Arabic-Indic digits",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-kid\": {\"role\": \"child\", \"handles\": [\"+1٥٥٥٠١٠٠١٠٢\"], \"preferred\": \"+1٥٥٥٠١٠٠١٠٢\"}}}",
+   "ok": false
+  },
+  {
+   "name": "NaN in a key nobody reads",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}}, \"x\": NaN}",
+   "ok": false
+  },
+  {
+   "name": "Infinity in a key nobody reads",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}}, \"x\": Infinity}",
+   "ok": false
+  },
+  {
+   "name": "a lone surrogate in a key nobody reads",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}}, \"note\": \"\\ud800\"}",
+   "ok": false
+  },
+  {
+   "name": "preferred null with no handles",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-adult\": {\"role\": \"adult\", \"handles\": [], \"preferred\": null}}}",
+   "ok": true
+  },
+  {
+   "name": "preferred null with handles",
+   "text": "{\"people\": {\"test-owner\": {\"role\": \"owner\", \"handles\": [\"+15550100001\"], \"preferred\": \"+15550100001\"}, \"test-adult\": {\"role\": \"adult\", \"handles\": [\"+15550100003\"], \"preferred\": null}}}",
+   "ok": false
+  }
+ ],
+ "_about_normalize": "How a raw handle becomes the form the map stores. The store script applies this to what Kevin types; the channel applies it to the sender BlueBubbles reports, after dropping a service prefix like `iMessage:`, before looking the handle up. `want` null means the handle is refused. Every handle is made up. A bare 10-digit number is taken as North American (+1): true for this family, but a number from elsewhere written without its country code is mapped wrong rather than refused. BlueBubbles 1.9.9 reports handle.address as +1 and 10 digits, and uncanonicalizedId as the bare 10 digits (Esme's probe, 2026-11-18).",
+ "normalize": [
+  {
+   "raw": "+15550100001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "5550100001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "15550100001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "(555) 010-0001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "555.010.0001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "555-010-0001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "+1 555 010 0001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "+1 (555) 010-0001",
+   "want": "+15550100001"
+  },
+  {
+   "raw": "+44 20 7946 0000",
+   "want": "+442079460000"
+  },
+  {
+   "raw": "+442079460000",
+   "want": "+442079460000"
+  },
+  {
+   "raw": "Kid@Example.COM",
+   "want": "kid@example.com"
+  },
+  {
+   "raw": "  kid@example.com ",
+   "want": "kid@example.com"
+  },
+  {
+   "raw": "555-010-0001 x23",
+   "want": null
+  },
+  {
+   "raw": "12",
+   "want": null
+  },
+  {
+   "raw": "call me",
+   "want": null
+  },
+  {
+   "raw": "+0123456789",
+   "want": null
+  },
+  {
+   "raw": "+1５５５０１００００１",
+   "want": null
+  },
+  {
+   "raw": "a..b@example.com",
+   "want": null
+  },
+  {
+   "raw": "a\"b@example.com",
+   "want": null
+  },
+  {
+   "raw": "a@example",
+   "want": null
+  }
+ ]
+}

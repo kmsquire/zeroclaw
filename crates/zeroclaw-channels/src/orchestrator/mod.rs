@@ -14699,7 +14699,14 @@ fn bluebubbles_conflicting_aliases(
         .map(|(alias, bb)| crate::bluebubbles::AliasPeers {
             alias: alias.as_str(),
             server_url: bb.server_url.as_str(),
-            peers: config.channel_external_peers("bluebubbles", alias),
+            // An alias with a people map admits whoever the map names, which
+            // config can't see, so it counts as admitting anyone: no other
+            // alias on the same server may start beside it.
+            peers: if bb.people_map_command().is_some() {
+                vec!["*".to_string()]
+            } else {
+                config.channel_external_peers("bluebubbles", alias)
+            },
             group_chat_guids: &bb.group_chat_guids,
         })
         .collect();

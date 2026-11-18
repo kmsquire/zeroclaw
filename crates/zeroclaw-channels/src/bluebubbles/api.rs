@@ -8,7 +8,20 @@
 use reqwest::{Client, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::LazyLock;
 use std::time::Duration;
+
+/// Phone numbers and emails, as they might appear in an error body: a
+/// failed query can echo a row or a chat GUID, and its excerpt is logged.
+static HANDLE_LIKE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\+?[0-9][0-9 ().-]{5,}[0-9]|[^\s@;,'\x22<>]+@[^\s@;,'\x22<>]+")
+        .expect("static regex")
+});
+
+/// An error body excerpt with anything shaped like a handle replaced.
+pub(crate) fn mask_handles(text: &str) -> String {
+    HANDLE_LIKE.replace_all(text, "[handle]").into_owned()
+}
 
 /// How long a send may take. BlueBubbles answers an AppleScript send only
 /// once the message row appears in the Messages database, and waits up to
@@ -284,8 +297,7 @@ impl BlueBubblesApi {
         };
         // Redact before cutting, so a cut can never leave part of the
         // password behind where the redaction no longer recognizes it.
-        let excerpt: String = self
-            .redact(&body)
+        let excerpt: String = mask_handles(&self.redact(&body))
             .chars()
             .filter(|c| !c.is_control())
             .take(ERROR_BODY_EXCERPT_CHARS)

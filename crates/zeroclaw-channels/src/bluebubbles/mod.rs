@@ -6,10 +6,15 @@
 //! [`inbound::classify`] for the rules and [`cursor`] for the poll cursor.
 
 mod api;
+mod control;
 mod cursor;
 mod inbound;
 mod overlap;
+mod people;
+mod source;
 
+#[cfg(test)]
+mod people_tests;
 #[cfg(test)]
 mod tests;
 
@@ -17,6 +22,8 @@ use api::{BlueBubblesApi, PolledRow};
 use async_trait::async_trait;
 use inbound::{AliasPolicy, CatchUp, ChatKind, Disposition, DropReason, OwnGuids};
 use parking_lot::Mutex;
+use people::People;
+use source::PeopleSource;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,7 +81,33 @@ pub struct BlueBubblesChannel {
     health: Arc<Mutex<HealthState>>,
     /// Unlisted group chats already reported, so each is named once.
     reported_groups: Arc<Mutex<HashSet<String>>>,
+    /// The people map, when the alias has `people_command`
+    /// (kmsquire/llm-workspace#181). Held in memory only.
+    people: Option<PeopleSource>,
+    /// Where the control socket listens, and the one uid it serves.
+    control_socket: Option<PathBuf>,
+    control_socket_uid: u32,
+    /// The chat GUID each person last wrote from, this run. A `dm:` reply
+    /// goes there; before the person has written, to their preferred handle.
+    last_dm: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
+
+/// Aborts a spawned task when dropped, so the control socket stops with the
+/// listener.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Retry for a people map that hasn't loaded: from 30 s up to 10 minutes.
+#[cfg(not(test))]
+const PEOPLE_BACKOFF_START: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PEOPLE_BACKOFF_START: Duration = Duration::from_millis(100);
+const PEOPLE_BACKOFF_MAX: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
 enum PollOutcome {
@@ -106,8 +139,16 @@ impl BlueBubblesChannel {
         config: &BlueBubblesConfig,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> anyhow::Result<Self> {
+        let alias = alias.into();
+        let people = config.people_map_command().map(PeopleSource::new);
+        if people.is_some() && !(peer_resolver)().is_empty() {
+            anyhow::bail!(
+                "BlueBubbles alias '{alias}' has people_command, so it takes its people from that \
+                 map alone; remove the peer group that names peers for bluebubbles.{alias}"
+            );
+        }
         Ok(Self {
-            alias: alias.into(),
+            alias,
             api: BlueBubblesApi::new(&config.server_url, &config.password)?,
             self_handles: config
                 .self_handles
@@ -123,7 +164,128 @@ impl BlueBubblesChannel {
             own_guids: Arc::new(Mutex::new(OwnGuids::default())),
             health: Arc::new(Mutex::new(HealthState::default())),
             reported_groups: Arc::new(Mutex::new(HashSet::new())),
+            control_socket: control::socket_path(config.control_socket.as_deref()),
+            control_socket_uid: config.control_socket_uid,
+            people,
+            last_dm: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// Start the control socket, if the alias has one. A socket that can't
+    /// be bound is logged and skipped: the channel still runs, with the
+    /// hourly re-read as its only refresh.
+    fn start_control(&self) -> Option<AbortOnDrop> {
+        let (Some(source), Some(path)) = (&self.people, &self.control_socket) else {
+            return None;
+        };
+        match control::bind(path, self.control_socket_uid) {
+            Ok(listener) => {
+                let serving = control::serve(
+                    listener,
+                    self.control_socket_uid,
+                    source.clone(),
+                    self.alias.clone(),
+                );
+                Some(AbortOnDrop(zeroclaw_spawn::spawn!(serving)))
+            }
+            Err(e) => {
+                self.note(
+                    Level::Warn,
+                    "BlueBubbles control socket could not be started; reloads will wait for the \
+                     hourly re-read",
+                    serde_json::json!({"error": e.to_string()}),
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether the alias may poll now. Without a people map it always may.
+    /// With one, not until a good map has loaded: polling with no map would
+    /// move the cursor past family messages and drop them for good. Loads
+    /// the map when it's missing, and re-reads it when the hourly backstop
+    /// is due.
+    async fn people_ready(&self) -> bool {
+        match &self.people {
+            None => true,
+            // Inline: the hourly re-read can hold the poll for up to the
+            // command's timeout once an hour, which is fine for a backstop.
+            Some(source) => self
+                .fresh_people(source, "startup", "hourly")
+                .await
+                .is_some(),
+        }
+    }
+
+    /// The people map, loaded when missing and re-read when the hourly
+    /// backstop is due. A missing map is retried at most every
+    /// PEOPLE_BACKOFF_START, so a burst of sends while Vault is down doesn't
+    /// run the command once per send.
+    async fn fresh_people(
+        &self,
+        source: &PeopleSource,
+        missing: &str,
+        due: &str,
+    ) -> Option<Arc<People>> {
+        let trigger = match source.current() {
+            None if source.attempted_within(PEOPLE_BACKOFF_START) => return None,
+            None => missing,
+            Some(_) if source.backstop_due() => due,
+            Some(people) => return Some(people),
+        };
+        let report = source.reload().await;
+        control::log_reload(&self.alias, trigger, &report);
+        source.current()
+    }
+
+    /// The chat GUID to send to. Without a people map, the recipient as it
+    /// was before. With one, only `dm:<person>` for someone in the map, or a
+    /// listed group chat: nothing can make the channel text a number outside
+    /// the family. The GUID this returns is checked against the handle
+    /// allowlist afterwards, like any other. Errors never repeat the
+    /// recipient, which could be a handle.
+    async fn resolve_recipient(&self, recipient: &str) -> anyhow::Result<String> {
+        let Some(source) = &self.people else {
+            return Ok(chat_guid_for(recipient));
+        };
+        if let Some(id) = recipient.strip_prefix(inbound::DM_PREFIX) {
+            // A channel built only to deliver (a cron announcement) has never
+            // listened, so it loads the map here, and keeps it fresh the same
+            // way the poll loop does.
+            let people = self
+                .fresh_people(source, "send", "send")
+                .await
+                .ok_or_else(|| {
+                    anyhow::Error::msg("BlueBubbles refused to send: the people map isn't loaded")
+                })?;
+            let person = people.by_id(id).ok_or_else(|| {
+                anyhow::Error::msg(
+                    "BlueBubbles refused to send: that person isn't in the people map",
+                )
+            })?;
+            let seen = self.last_dm.lock().get(id).cloned();
+            if let Some(guid) = seen.filter(|g| {
+                inbound::direct_chat_handle(g).is_some_and(|h| {
+                    people::canonical_handle(&inbound::normalize_handle(h))
+                        .is_some_and(|c| person.handles.contains(&c))
+                })
+            }) {
+                return Ok(guid);
+            }
+            let preferred = person.preferred.as_deref().ok_or_else(|| {
+                anyhow::Error::msg("BlueBubbles refused to send: that person has no handle")
+            })?;
+            return Ok(format!("iMessage;-;{preferred}"));
+        }
+        if inbound::chat_kind(recipient) == Some(ChatKind::Group)
+            && self.group_chat_guids.iter().any(|g| g == recipient)
+        {
+            return Ok(recipient.to_string());
+        }
+        anyhow::bail!(
+            "BlueBubbles refused to send: with a people map, a recipient is dm:<person> or a \
+             listed group chat"
+        )
     }
 
     /// Keep the poll cursor in this directory, so a restart resumes where the
@@ -406,13 +568,21 @@ impl BlueBubblesChannel {
                 self.own_guids.lock().insert(m.guid.clone());
             }
         }
-        let peers = (self.peer_resolver)();
+        // With a people map, config peers are never read: the map is the
+        // only source. One snapshot for the whole window.
+        let people = self.people.as_ref().and_then(PeopleSource::current);
+        let peers = if self.people.is_some() {
+            Vec::new()
+        } else {
+            (self.peer_resolver)()
+        };
         let policy = AliasPolicy {
             alias: &self.alias,
             self_handles: &self.self_handles,
             group_chat_guids: &self.group_chat_guids,
             mention_names: &self.mention_names,
             peers: &peers,
+            people: people.as_deref(),
         };
         // Which messages reply to the bot, and which could start a turn at
         // all; both are settled before catch-up chooses what to answer.
@@ -444,12 +614,14 @@ impl BlueBubblesChannel {
                 match inbound::classify(m, catch_up, replies, &policy) {
                     Disposition::Drop(reason) => self.report_drop(m.original_rowid, &reason),
                     Disposition::Context(msg) => {
+                        self.remember_dm(&msg, m);
                         tally.count(catch_up, false);
                         if tx.send(msg).await.is_err() {
                             return Some(PollOutcome::ReceiverClosed);
                         }
                     }
                     Disposition::Turn(msg) => {
+                        self.remember_dm(&msg, m);
                         tally.count(catch_up, true);
                         if tx.send(msg).await.is_err() {
                             return Some(PollOutcome::ReceiverClosed);
@@ -472,6 +644,18 @@ impl BlueBubblesChannel {
             self.save_cursor(cur);
         }
         None
+    }
+
+    /// Remember which chat a person's `dm:` token stands for this run.
+    fn remember_dm(&self, msg: &ChannelMessage, m: &api::BbMessage) {
+        if let (Some(id), Some(chat)) = (
+            msg.reply_target.strip_prefix(inbound::DM_PREFIX),
+            m.chats.first(),
+        ) {
+            self.last_dm
+                .lock()
+                .insert(id.to_string(), chat.guid.clone());
+        }
     }
 
     fn report_drop(&self, rowid: i64, reason: &DropReason) {
@@ -616,11 +800,12 @@ impl Channel for BlueBubblesChannel {
     }
 
     fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
-        inbound::chat_kind(&msg.reply_target) == Some(ChatKind::Direct)
+        msg.reply_target.starts_with(inbound::DM_PREFIX)
+            || inbound::chat_kind(&msg.reply_target) == Some(ChatKind::Direct)
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let chat_guid = chat_guid_for(&message.recipient);
+        let chat_guid = self.resolve_recipient(&message.recipient).await?;
         if !api::is_valid_chat_guid(&chat_guid) {
             anyhow::bail!("BlueBubbles refused to send: recipient is not a valid chat GUID");
         }
@@ -677,6 +862,7 @@ impl Channel for BlueBubblesChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let _control = self.start_control();
         let mut backoff = BACKOFF_START;
         let (mut cur, start) = loop {
             match self.start_cursor().await {
@@ -700,7 +886,17 @@ impl Channel for BlueBubblesChannel {
         // A fresh start has no record of what was already answered, so its
         // first poll reads missed messages as context only.
         let mut allow_answers = start.is_resume();
+        let mut people_backoff = PEOPLE_BACKOFF_START;
         loop {
+            if !self.people_ready().await {
+                // Admit nobody and don't poll; the cursor stays put, so what
+                // arrives meanwhile is caught up once the map loads.
+                self.record_failure();
+                tokio::time::sleep(people_backoff).await;
+                people_backoff = (people_backoff * 2).min(PEOPLE_BACKOFF_MAX);
+                continue;
+            }
+            people_backoff = PEOPLE_BACKOFF_START;
             match self.poll_once(&tx, &mut cur, allow_answers).await {
                 Ok(PollOutcome::ReceiverClosed) => return Ok(()),
                 Ok(PollOutcome::Continue) => {
