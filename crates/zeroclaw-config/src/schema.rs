@@ -18526,6 +18526,27 @@ pub struct BlueBubblesConfig {
     #[tab(Advanced)]
     #[serde(default = "default_bluebubbles_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// A program, by absolute path, whose stdout is this alias's people map:
+    /// JSON naming each person, their role and their handles. When set, the
+    /// alias admits only the map's people and takes nothing from peer groups;
+    /// a peer group that names peers for it stops it starting. The map is held
+    /// in memory only, and every message the channel hands on names the person,
+    /// never the handle. Run with no arguments and no shell; stderr is ignored.
+    /// Until a good map loads the alias admits nobody and doesn't poll.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub people_command: Option<String>,
+    /// A unix socket, by absolute path, on which the channel takes `reload`
+    /// (re-run `people_command`) and `status`, answering with counts only.
+    /// Its directory must exist, owned by `control_socket_uid`, mode 0700.
+    /// Needs `people_command`.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_socket: Option<String>,
+    /// The only uid the control socket serves. Default: `0` (root).
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub control_socket_uid: u32,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -18559,6 +18580,15 @@ impl Default for BlueBubblesConfig {
 }
 
 impl BlueBubblesConfig {
+    /// The `people_command` this alias runs, if it has one: trimmed, and
+    /// `None` when empty. The channel and the overlap check both read it here.
+    pub fn people_map_command(&self) -> Option<&str> {
+        self.people_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
+
     /// Whether both required credentials (`server_url`, `password`) are set.
     /// The orchestrator skips an enabled alias without them rather than
     /// building a listener that can never authenticate.
@@ -18582,7 +18612,24 @@ impl BlueBubblesConfig {
             &enabled_path,
             self.enabled,
             &self.password,
-        )
+        )?;
+        let absolute = |v: &Option<String>| {
+            v.as_deref()
+                .is_none_or(|p| std::path::Path::new(p.trim()).is_absolute())
+        };
+        if !absolute(&self.people_command) {
+            anyhow::bail!("channels.bluebubbles.{alias}.people_command must be an absolute path");
+        }
+        if !absolute(&self.control_socket) {
+            anyhow::bail!("channels.bluebubbles.{alias}.control_socket must be an absolute path");
+        }
+        if self.control_socket.is_some() && self.people_command.is_none() {
+            anyhow::bail!(
+                "channels.bluebubbles.{alias}.control_socket needs \
+                 channels.bluebubbles.{alias}.people_command"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -25001,8 +25048,17 @@ impl Config {
             sig.validate_required(alias)?;
         }
 
+        let mut control_sockets: HashMap<&str, &str> = HashMap::new();
         for (alias, bb) in &self.channels.bluebubbles {
             bb.validate_required(alias)?;
+            if let Some(path) = bb.control_socket.as_deref().map(str::trim)
+                && let Some(other) = control_sockets.insert(path, alias.as_str())
+            {
+                anyhow::bail!(
+                    "channels.bluebubbles.{alias}.control_socket and \
+                     channels.bluebubbles.{other}.control_socket are the same path"
+                );
+            }
         }
 
         for (alias, vc) in &self.channels.voice_call {

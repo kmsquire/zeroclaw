@@ -91,6 +91,7 @@ fn policy<'a>(peers: &'a [String], self_handles: &'a [String]) -> AliasPolicy<'a
         group_chat_guids: GROUPS.get_or_init(|| vec![FAMILY_GROUP.to_string()]),
         mention_names: NAMES.get_or_init(|| vec!["Early".to_string()]),
         peers,
+        people: None,
     }
 }
 
