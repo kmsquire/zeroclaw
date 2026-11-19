@@ -381,7 +381,8 @@ impl BlueBubblesApi {
     /// Send text to a chat with AppleScript. A failed connection is retried
     /// once, because the request never reached the server; anything after
     /// the request was sent is not, because a send the server finishes late
-    /// would go out twice.
+    /// would go out twice. BlueBubbles 1.9.9 does not deduplicate on
+    /// `tempGuid`: two sends with the same one deliver two messages.
     pub(crate) async fn send_text(
         &self,
         chat_guid: &str,
