@@ -1566,6 +1566,69 @@ async fn a_refused_connection_is_retried_once_and_a_timeout_never() {
     assert!(!text.contains("password="), "URL leaked into: {text}");
 }
 
+/// BlueBubbles 1.9.9 does not deduplicate on `tempGuid`, so any resend of a
+/// request the server read would text twice. A server that reads the request
+/// and then drops the connection, without answering, must see it once.
+#[tokio::test]
+async fn a_request_the_server_read_is_never_sent_again() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = seen.clone();
+    zeroclaw_spawn::spawn!(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut got = Vec::new();
+            while let Ok(n) = conn.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") && got.ends_with(b"}") {
+                    break;
+                }
+            }
+            if got.starts_with(b"POST /api/v1/message/text") {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            drop(conn);
+        }
+    });
+    let api = BlueBubblesApi::new(&format!("http://{addr}"), &test_password()).unwrap();
+    let err = api.send_text(DM, "hello", "temp-1").await.unwrap_err();
+    assert!(
+        !matches!(err, api::SendError::Connect(_)),
+        "a dropped connection after the request was written is not a connect error: {err:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_server_error_is_never_sent_again() {
+    let pw = test_password();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/message/text"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let ch = channel(&server.uri(), &pw);
+    assert!(ch.send(&SendMessage::new("hello", DM)).await.is_err());
+    let sends = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == "/api/v1/message/text")
+        .count();
+    assert_eq!(
+        sends, 1,
+        "a send the server answered with an error must not be repeated"
+    );
+}
+
 #[tokio::test]
 async fn a_timed_out_send_that_landed_is_reported_as_sent() {
     let pw = test_password();
