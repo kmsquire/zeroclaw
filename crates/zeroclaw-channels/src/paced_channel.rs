@@ -393,6 +393,13 @@ impl Channel for PacedChannel {
         self.inner.uses_cancel_token()
     }
 
+    /// Without this the trait default (`true`) answers for the wrapper, and a
+    /// channel that keeps its text out of the log would have it logged as soon
+    /// as pacing wraps it.
+    fn logs_message_content(&self) -> bool {
+        self.inner.logs_message_content()
+    }
+
     async fn stop_typing(&self, recipient: &str) -> Result<()> {
         self.inner.stop_typing(recipient).await
     }
@@ -800,6 +807,44 @@ mod tests {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// A channel that keeps its text out of the log.
+    struct PrivateChannel;
+
+    impl Attributable for PrivateChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "private"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for PrivateChannel {
+        fn name(&self) -> &str {
+            "private"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn logs_message_content(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn pacing_keeps_a_channels_text_out_of_the_log() {
+        let cfg = PacingFixture {
+            interval_secs: 5,
+            depth: 0,
+        };
+        let wrapped = PacedChannel::wrap(Arc::new(PrivateChannel), &cfg);
+        assert!(!wrapped.logs_message_content());
     }
 
     #[tokio::test]

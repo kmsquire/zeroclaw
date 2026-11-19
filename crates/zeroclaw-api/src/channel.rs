@@ -1133,6 +1133,14 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether the text of messages on this channel may be written to the
+    /// log. Default `true`. A channel whose conversations are private returns
+    /// `false`, and the orchestrator's inbound and delivered records then
+    /// carry who, when and how long, but never the text.
+    fn logs_message_content(&self) -> bool {
+        true
+    }
+
     /// Whether this channel implements the turn-flush narration contract:
     /// `flush_draft_turn` delivers each completed agent text turn as a permanent
     /// outbound message, and the orchestrator therefore routes that narration

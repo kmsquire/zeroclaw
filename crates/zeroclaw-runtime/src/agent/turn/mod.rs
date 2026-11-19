@@ -3243,7 +3243,8 @@ async fn run_tool_call_loop_impl<'a>(
                     .with_attrs(::serde_json::json!({
                         "model": active_model,
                         "iteration": iteration + 1,
-                        "text": scrub_credentials(&display_text),
+                        "text": ::zeroclaw_log::loggable_text(&scrub_credentials(&display_text)),
+                        "text_chars": display_text.chars().count(),
                         "trace_id": turn_id,
                     })),
                 "turn_final_response"
