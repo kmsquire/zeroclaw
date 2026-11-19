@@ -18547,6 +18547,13 @@ pub struct BlueBubblesConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub control_socket_uid: u32,
+    /// Whether message text on this alias may be written to ZeroClaw's log.
+    /// `false` keeps the inbound and delivered records to who, when and how
+    /// long. Default: `false` for an alias with `people_command` (its
+    /// conversations are private by design), `true` otherwise.
+    #[tab(Behavior)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_content: Option<bool>,
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -18587,6 +18594,13 @@ impl BlueBubblesConfig {
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty())
+    }
+
+    /// Whether message text may be logged: `log_content` when set, else off
+    /// for an alias with a people map and on otherwise.
+    pub fn logs_content(&self) -> bool {
+        self.log_content
+            .unwrap_or_else(|| self.people_map_command().is_none())
     }
 
     /// Whether both required credentials (`server_url`, `password`) are set.

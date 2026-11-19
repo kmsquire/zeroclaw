@@ -414,6 +414,43 @@ async fn a_stale_socket_is_replaced() {
 }
 
 #[test]
+fn log_content_defaults_off_with_a_people_map_and_on_without() {
+    use zeroclaw_api::channel::Channel;
+    let base = zeroclaw_config::schema::BlueBubblesConfig {
+        server_url: "http://127.0.0.1:1".into(),
+        password: "test-password".into(),
+        ..Default::default()
+    };
+    let peers: std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+        std::sync::Arc::new(Vec::new);
+    let logs = |cfg: &zeroclaw_config::schema::BlueBubblesConfig| {
+        super::BlueBubblesChannel::new("family", cfg, peers.clone())
+            .unwrap()
+            .logs_message_content()
+    };
+    assert!(logs(&base), "without a people map, upstream's behavior");
+    let family = zeroclaw_config::schema::BlueBubblesConfig {
+        people_command: Some("/usr/local/sbin/fetch".into()),
+        ..base.clone()
+    };
+    assert!(
+        !logs(&family),
+        "a people map keeps its text out of the log by default"
+    );
+    for (people_map, set, want) in [(false, false, false), (true, true, true)] {
+        let cfg = zeroclaw_config::schema::BlueBubblesConfig {
+            log_content: Some(set),
+            ..if people_map {
+                family.clone()
+            } else {
+                base.clone()
+            }
+        };
+        assert_eq!(logs(&cfg), want, "an explicit log_content = {set} wins");
+    }
+}
+
+#[test]
 fn people_command_and_control_socket_are_checked_at_load() {
     let parse = |extra: &str| -> anyhow::Result<()> {
         let cfg: zeroclaw_config::schema::BlueBubblesConfig = toml::from_str(&format!(
@@ -422,12 +459,7 @@ fn people_command_and_control_socket_are_checked_at_load() {
         cfg.validate_required("family")
     };
     assert!(parse("").is_ok());
-    assert!(
-        parse(
-            "people_command = \"/usr/local/sbin/fetch\"\ncontrol_socket = \"/run/x/family.sock\""
-        )
-        .is_ok()
-    );
+    assert!(parse("people_command = \"/usr/local/sbin/fetch\"\ncontrol_socket = \"/run/x/family.sock\"\nlog_content = false").is_ok());
     let relative = parse("people_command = \"fetch\"").unwrap_err().to_string();
     assert!(
         relative.contains("people_command must be an absolute path"),

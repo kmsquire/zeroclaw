@@ -290,7 +290,7 @@ pub(crate) async fn interpret_chat_response(
                     "model": model,
                     "iteration": iteration + 1,
                     "issue": issue.as_str(),
-                    "response": scrub_credentials(&response_text),
+                    "response": ::zeroclaw_log::loggable_text(&scrub_credentials(&response_text)),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_parse_issue"
@@ -458,7 +458,8 @@ pub(crate) async fn record_accepted_chat_response(
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": cost_usd,
-                "raw_response": scrub_credentials(response_text),
+                "raw_response": ::zeroclaw_log::loggable_text(&scrub_credentials(response_text)),
+                "raw_response_chars": response_text.chars().count(),
                 "native_tool_calls": native_tool_calls.len(),
                 "parsed_tool_calls": parsed_tool_calls,
                 "trace_id": ctx.turn_id,

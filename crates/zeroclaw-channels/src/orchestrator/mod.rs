@@ -8318,7 +8318,12 @@ async fn process_channel_message_with_delivery_id(
     let sender = msg.sender.clone();
     let message_id = msg.id.clone();
     let composite_for_body = channel_composite.clone();
-    zeroclaw_log::scope!(
+    // A channel that keeps its text out of the log (or can't be found, which
+    // gets no benefit of the doubt) runs its whole turn with text private, so
+    // the runtime's records of the model's reply leave it out too.
+    let private = !find_channel_for_message(&ctx.channels_by_name, &msg)
+        .is_some_and(|c| c.logs_message_content());
+    let turn = zeroclaw_log::scope!(
         category: "channel",
         agent_alias: agent_alias.as_str(),
         channel: channel_composite.as_str(),
@@ -8335,8 +8340,8 @@ async fn process_channel_message_with_delivery_id(
             )
             .await;
         }
-    )
-    .await;
+    );
+    zeroclaw_log::with_private_content(private, turn).await;
 }
 
 /// Resolve whether this inbound message uses Matrix `single_message`
@@ -9302,7 +9307,8 @@ async fn process_channel_message_body(
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
-                "content": msg.content,
+                "content": zeroclaw_log::loggable_text(&msg.content),
+                "content_chars": msg.content.chars().count(),
                 "attachments_count": msg.attachments.len(),
                 "passive_context": msg.passive_context,
             })
@@ -11252,7 +11258,11 @@ async fn process_channel_message_body(
                                 "model_provider": route.model_provider,
                                 "model": route.model,
                                 "sender": msg.sender,
-                                "response": scrub_credentials(&delivered_response),
+                                "message_id": msg.id,
+                                "response": zeroclaw_log::loggable_text(&scrub_credentials(
+                                    &delivered_response
+                                )),
+                                "response_chars": delivered_response.chars().count(),
                             })),
                             "channel_message_outbound"
                         );
@@ -11271,7 +11281,8 @@ async fn process_channel_message_body(
                                 "message_id": msg.id,
                                 "reply_target": msg.reply_target,
                                 "thread_ts": msg.thread_ts,
-                                "content": delivered_response,
+                                "content": zeroclaw_log::loggable_text(&delivered_response),
+                                "content_chars": delivered_response.chars().count(),
                             })),
                             "reply delivered"
                         );
@@ -27383,6 +27394,158 @@ api_key = "anthropic-key"
             event["message"].as_str(),
             Some("reply delivered" | "channel_message_outbound")
         ) && event.pointer("/event/outcome").and_then(|v| v.as_str()) == Some("success")
+    }
+
+    /// A channel whose text stays out of the log, and a model whose reply is
+    /// as recognizable as the message, for llm-workspace#181's decision 6.
+    struct PrivateLogChannel;
+
+    impl zeroclaw_api::attribution::Attributable for PrivateLogChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "private-log"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PrivateLogChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn logs_message_content(&self) -> bool {
+            false
+        }
+    }
+
+    struct RecognizableReplyProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecognizableReplyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("REPLY-TEXT-31337 see you at dinner".to_string())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RecognizableReplyProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "recognizable"
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_private_channels_text_never_reaches_a_log_record() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(PrivateLogChannel),
+            Arc::new(RecognizableReplyProvider),
+            Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.id = "private-log-1".to_string();
+        msg.content = "INBOUND-TEXT-31337 what's for dinner".to_string();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            process_channel_message(ctx, msg, CancellationToken::new()),
+        )
+        .await
+        .expect("the turn should finish");
+
+        // Every record from the turn, not only those tagged with its
+        // message_id: an untagged record can carry the text just as well.
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["message"].as_str())
+            .collect();
+        for name in [
+            "channel inbound message",
+            "channel_message_outbound",
+            "reply delivered",
+        ] {
+            assert!(
+                names.contains(&name),
+                "no {name:?} record to check: {names:?}"
+            );
+        }
+        let leaks: Vec<String> = events
+            .iter()
+            .filter(|e| {
+                let text = e.to_string();
+                text.contains("INBOUND-TEXT-31337") || text.contains("REPLY-TEXT-31337")
+            })
+            .map(|e| {
+                let keys: Vec<&String> = e["attributes"]
+                    .as_object()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|(_, v)| {
+                                let v = v.to_string();
+                                v.contains("INBOUND-TEXT-31337") || v.contains("REPLY-TEXT-31337")
+                            })
+                            .map(|(k, _)| k)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{} at {}:{} in {keys:?}",
+                    e["message"], e["attributes"]["_file"], e["attributes"]["_line"]
+                )
+            })
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "records carry the text:\n{}",
+            leaks.join("\n")
+        );
+        let inbound = events
+            .iter()
+            .find(|e| e["message"] == "channel inbound message")
+            .unwrap();
+        assert_eq!(
+            inbound.pointer("/attributes/content_chars"),
+            Some(&serde_json::json!(36))
+        );
     }
 
     #[allow(clippy::await_holding_lock)]

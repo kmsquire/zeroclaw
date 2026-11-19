@@ -73,6 +73,8 @@ pub struct BlueBubblesChannel {
     group_chat_guids: Vec<String>,
     mention_names: Vec<String>,
     poll_interval: Duration,
+    /// Whether message text may reach ZeroClaw's log (`log_content`).
+    log_content: bool,
     /// Resolves the alias's peers from live config at message time.
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Where the poll cursor is kept. `None` keeps it in memory only.
@@ -159,6 +161,7 @@ impl BlueBubblesChannel {
             group_chat_guids: config.group_chat_guids.clone(),
             mention_names: config.mention_names.clone(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
+            log_content: config.logs_content(),
             peer_resolver,
             workspace_dir: None,
             own_guids: Arc::new(Mutex::new(OwnGuids::default())),
@@ -797,6 +800,10 @@ impl Channel for BlueBubblesChannel {
 
     fn self_addressed_mention(&self) -> Option<String> {
         self.mention_names.first().cloned()
+    }
+
+    fn logs_message_content(&self) -> bool {
+        self.log_content
     }
 
     fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
