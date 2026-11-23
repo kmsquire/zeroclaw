@@ -1558,11 +1558,14 @@ async fn deliver_if_configured(
         anyhow::Error::msg("delivery.to is required for announce mode")
     })?;
 
+    let unfurl = delivery.unfurl();
+
     deliver_announcement(
         config,
         channel,
         target,
         delivery.thread_id.as_deref(),
+        unfurl,
         output,
     )
     .await
@@ -1572,12 +1575,14 @@ async fn deliver_if_configured(
 /// Delivery function type — takes owned values so the returned future is 'static.
 /// The fourth `Option<String>` is the optional thread/conversation id propagated
 /// to channels whose outbound `thread_id` is distinct from the recipient (webhook).
+/// The fifth is the message's link-preview choice, which only Slack reads.
 pub type DeliveryFn = Box<
     dyn Fn(
             Config,
             String,
             String,
             Option<String>,
+            zeroclaw_api::channel::LinkUnfurl,
             String,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
@@ -1597,6 +1602,7 @@ pub async fn deliver_announcement(
     channel: &str,
     target: &str,
     thread_id: Option<&str>,
+    unfurl: zeroclaw_api::channel::LinkUnfurl,
     output: &str,
 ) -> Result<()> {
     if let Some(f) = DELIVERY_FN.get() {
@@ -1605,6 +1611,7 @@ pub async fn deliver_announcement(
             channel.to_string(),
             target.to_string(),
             thread_id.map(str::to_string),
+            unfurl,
             output.to_string(),
         )
         .await
@@ -3854,6 +3861,8 @@ mod tests {
                 to: Some("123456".into()),
                 thread_id: None,
                 best_effort: false,
+                unfurl_links: None,
+                unfurl_media: None,
             }),
             false,
             None,
@@ -3896,6 +3905,8 @@ mod tests {
             to: Some("123456".into()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -3940,6 +3951,8 @@ mod tests {
             to: Some("123456".into()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
 
         let outcome = deliver_and_classify_run_result(
@@ -4056,6 +4069,8 @@ mod tests {
             to: Some("123456".into()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
         let outcome = deliver_and_classify_run_result(
             &config,
@@ -4116,6 +4131,8 @@ mod tests {
             to: Some("123456".into()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
@@ -4187,33 +4204,49 @@ mod tests {
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
 
+    /// Channel name whose link-preview choice the recorder keeps.
+    const UNFURL_CHANNEL: &str = "unfurl-delivery";
+    static UNFURL_SEEN: std::sync::Mutex<Vec<zeroclaw_api::channel::LinkUnfurl>> =
+        std::sync::Mutex::new(Vec::new());
+
     fn register_recording_delivery_fn() {
         // Idempotent: register_delivery_fn is a no-op once the OnceLock is set,
         // so repeated calls across tests are safe and the first writer wins. The
         // handler honours the `fail-delivery` failure contract used by the
         // delivery-classification tests so it composes regardless of order.
-        register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
-            Box::pin(async move {
-                if channel == "paused-admission-delivery" {
-                    DELIVERY_ENTERED.notify_one();
-                    DELIVERY_RELEASE.notified().await;
-                }
-                if channel == "fail-delivery" {
-                    anyhow::bail!("synthetic delivery failure");
-                }
-                if channel == COUNT_CHANNEL {
-                    DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                if channel == CONTEXT_FAILURE_CHANNEL {
-                    assert_eq!(
-                        output,
-                        crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
-                    );
-                    CONTEXT_FAILURES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Ok(())
-            })
-        }));
+        register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread, unfurl, output| {
+                Box::pin(async move {
+                    if channel == UNFURL_CHANNEL {
+                        UNFURL_SEEN
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(unfurl);
+                    }
+                    if channel == "paused-admission-delivery" {
+                        DELIVERY_ENTERED.notify_one();
+                        DELIVERY_RELEASE.notified().await;
+                    }
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    if channel == COUNT_CHANNEL {
+                        DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if channel == CONTEXT_FAILURE_CHANNEL {
+                        assert_eq!(
+                            output,
+                            crate::i18n::get_required_cli_string(
+                                "turn-context-window-exceeded-error"
+                            )
+                        );
+                        CONTEXT_FAILURES_DELIVERED
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            },
+        ));
     }
 
     #[tokio::test]
@@ -4230,6 +4263,8 @@ mod tests {
                 to: Some("local-test".into()),
                 thread_id: None,
                 best_effort: false,
+                unfurl_links: None,
+                unfurl_media: None,
             };
             let authority = crate::LiveConfigAuthority::new(config.clone());
             let lifecycle = authority.agent_lifecycle();
@@ -4288,8 +4323,36 @@ mod tests {
             to: Some("chat-id".to_string()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
         job
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_passes_the_jobs_unfurl_choice() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = announce_job();
+        job.delivery.channel = Some(UNFURL_CHANNEL.to_string());
+        job.delivery.unfurl_links = Some(false);
+        job.delivery.unfurl_media = Some(true);
+
+        // The channel is not Slack, so this also covers the warning path:
+        // the warning must not stop delivery.
+        let disposition = deliver_if_configured(&config, &job, "digest")
+            .await
+            .unwrap();
+
+        assert!(matches!(disposition, DeliveryDisposition::Delivered));
+        assert_eq!(
+            *UNFURL_SEEN.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![zeroclaw_api::channel::LinkUnfurl {
+                links: Some(false),
+                media: Some(true),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -4366,9 +4429,16 @@ mod tests {
         // failure. The caller (persist_job_result) should record the job
         // execution as successful; the missing handler is logged via
         // tracing::warn for operator visibility.
-        deliver_announcement(&config, "telegram", "chat-id", None, "payload")
-            .await
-            .expect("missing delivery handler should be Ok with a warn log");
+        deliver_announcement(
+            &config,
+            "telegram",
+            "chat-id",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "payload",
+        )
+        .await
+        .expect("missing delivery handler should be Ok with a warn log");
     }
 
     #[test]

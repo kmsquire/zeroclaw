@@ -14096,9 +14096,16 @@ pub async fn send_channel_message(
         Err(err)
             if channel_id.contains('.') && err.downcast_ref::<UnknownChannelId>().is_some() =>
         {
-            deliver_announcement(config, channel_id, recipient, None, message)
-                .await
-                .with_context(|| format!("Failed to send message via {channel_id}"))?;
+            deliver_announcement(
+                config,
+                channel_id,
+                recipient,
+                None,
+                zeroclaw_api::channel::LinkUnfurl::default(),
+                message,
+            )
+            .await
+            .with_context(|| format!("Failed to send message via {channel_id}"))?;
             println!("Message sent via {channel_id}.");
             return Ok(());
         }
@@ -17943,6 +17950,7 @@ pub async fn deliver_announcement(
     channel: &str,
     target: &str,
     thread_id: Option<String>,
+    unfurl: zeroclaw_api::channel::LinkUnfurl,
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
@@ -17954,7 +17962,11 @@ pub async fn deliver_announcement(
     );
     let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
-    let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
+    let make_msg = |s: &str| {
+        SendMessage::new(s, target)
+            .in_thread(thread_id.clone())
+            .with_unfurl(unfurl)
+    };
 
     // Snapshot out of the sync RwLock before awaiting. Use the live
     // channel instance when available — critical for Matrix E2EE which
@@ -22407,6 +22419,7 @@ temperature = 0.3
             "wecom_ws.removed",
             "recipient",
             None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
             "message",
         )
         .await
@@ -22438,6 +22451,51 @@ temperature = 0.3
             .agents
             .insert("sales".into(), daemon_factory_agent(bindings, true));
         config
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_carries_unfurl_to_the_live_channel() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let slack = Arc::new(SendMessageRecordingChannel {
+            channel_name: "slack",
+            ..SendMessageRecordingChannel::default()
+        });
+        let live: Arc<dyn Channel> = slack.clone();
+        let (_published, _lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "Slack",
+            alias: Some("default".to_string()),
+            channel: live,
+        }]);
+        let unfurl = zeroclaw_api::channel::LinkUnfurl {
+            links: Some(false),
+            media: None,
+        };
+
+        deliver_announcement(
+            &Config::default(),
+            "slack.default",
+            "U123",
+            None,
+            unfurl,
+            "digest with https://example.com/page",
+        )
+        .await
+        .expect("delivery through the live channel succeeds");
+
+        let sent = slack.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "exactly one message reaches the live channel"
+        );
+        assert_eq!(sent[0].recipient, "U123");
+        assert_eq!(sent[0].unfurl, unfurl);
     }
 
     #[tokio::test]
@@ -57989,12 +58047,19 @@ Done."#;
         let config = zeroclaw_config::schema::Config::default();
 
         for channel in ["lark.default", "feishu.default"] {
-            let err = deliver_announcement(&config, channel, "oc_test_chat", None, "hi")
-                .await
-                .err()
-                .unwrap_or_else(|| {
-                    panic!("expected {channel} to bail because channel is not configured")
-                });
+            let err = deliver_announcement(
+                &config,
+                channel,
+                "oc_test_chat",
+                None,
+                zeroclaw_api::channel::LinkUnfurl::default(),
+                "hi",
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("expected {channel} to bail because channel is not configured")
+            });
             let msg = format!("{err:#}");
             assert!(
                 !msg.contains("unsupported delivery channel"),
@@ -58012,9 +58077,16 @@ Done."#;
     async fn deliver_announcement_routes_email_to_email_arm() {
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
-            .await
-            .expect_err("expected email.default to bail because channel is not configured");
+        let err = deliver_announcement(
+            &config,
+            "email.default",
+            "user@example.com",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "hi",
+        )
+        .await
+        .expect_err("expected email.default to bail because channel is not configured");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("unsupported delivery channel"),
@@ -58031,9 +58103,16 @@ Done."#;
     async fn deliver_announcement_routes_qq_to_qq_arm() {
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = deliver_announcement(&config, "qq.qq", "user:OPENID", None, "hi")
-            .await
-            .expect_err("expected qq.qq to bail because channel is not configured");
+        let err = deliver_announcement(
+            &config,
+            "qq.qq",
+            "user:OPENID",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "hi",
+        )
+        .await
+        .expect_err("expected qq.qq to bail because channel is not configured");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("unsupported delivery channel"),
@@ -58065,9 +58144,16 @@ Done."#;
             },
         );
 
-        let err = deliver_announcement(&config, "qq.work", "user:OPENID", None, "hi")
-            .await
-            .expect_err("a disabled qq alias must not be delivered to");
+        let err = deliver_announcement(
+            &config,
+            "qq.work",
+            "user:OPENID",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "hi",
+        )
+        .await
+        .expect_err("a disabled qq alias must not be delivered to");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("[channels.qq.work] is disabled"),
@@ -58084,9 +58170,16 @@ Done."#;
     async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
-            .await
-            .expect_err("expected whatsapp.default to bail because channel is not configured");
+        let err = deliver_announcement(
+            &config,
+            "whatsapp.default",
+            "+15551234567",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "hi",
+        )
+        .await
+        .expect_err("expected whatsapp.default to bail because channel is not configured");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("unsupported delivery channel"),
@@ -58113,9 +58206,16 @@ Done."#;
             },
         );
 
-        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
-            .await
-            .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
+        let err = deliver_announcement(
+            &config,
+            "whatsapp.default",
+            "+15551234567",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "hi",
+        )
+        .await
+        .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("WhatsApp channel send requires Web mode"),
@@ -58154,9 +58254,16 @@ Done."#;
             },
         );
 
-        let err = deliver_announcement(&config, "feishu.work", "oc_test_chat", None, "hi")
-            .await
-            .expect_err("expected bail when channel=feishu but use_feishu=false");
+        let err = deliver_announcement(
+            &config,
+            "feishu.work",
+            "oc_test_chat",
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            "hi",
+        )
+        .await
+        .expect_err("expected bail when channel=feishu but use_feishu=false");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("use_feishu=false"),

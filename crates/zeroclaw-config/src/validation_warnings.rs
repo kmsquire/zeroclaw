@@ -63,6 +63,9 @@ pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configur
 /// - `cron_job_contested_claim`: a cron job id is listed in the `cron_jobs` of
 ///   more than one enabled agent; without a stored owner the job is refused
 ///   rather than run under an arbitrary claimant.
+/// - `cron_delivery_unfurl_ignored`: a declared cron job sets
+///   `delivery.unfurl_links` or `delivery.unfurl_media` for a channel other
+///   than Slack. Only Slack reads them, so they have no effect there.
 /// - `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but
 ///   the transport only consults it under `mode = "personal"`, so it currently
 ///   has no effect. `dm_policy` and `group_policy` apply under both modes and

@@ -2129,6 +2129,8 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         to: decl.to.clone(),
         thread_id: decl.thread_id.clone(),
         best_effort: decl.best_effort,
+        unfurl_links: decl.unfurl_links,
+        unfurl_media: decl.unfurl_media,
     }
 }
 
@@ -5490,6 +5492,8 @@ mod tests {
                 to: Some("1234567890".into()),
                 thread_id: None,
                 best_effort: true,
+                unfurl_links: None,
+                unfurl_media: None,
             }),
         )
         .unwrap();
@@ -5526,6 +5530,8 @@ mod tests {
                 to: None,
                 thread_id: None,
                 best_effort: true,
+                unfurl_links: None,
+                unfurl_media: None,
             }),
             false,
             None,
@@ -5564,6 +5570,8 @@ mod tests {
                     to: None,
                     thread_id: None,
                     best_effort: true,
+                    unfurl_links: None,
+                    unfurl_media: None,
                 }),
                 ..CronJobPatch::default()
             },
@@ -5595,6 +5603,8 @@ mod tests {
                 to: Some("1234567890".into()),
                 thread_id: None,
                 best_effort: true,
+                unfurl_links: None,
+                unfurl_media: None,
             }),
         )
         .unwrap_err();
@@ -6780,6 +6790,61 @@ schedule = { kind = "every", every_ms = 300000 }
     }
 
     #[test]
+    fn declarative_delivery_unfurl_reaches_the_stored_job() {
+        let toml_str = r#"
+[cron.digest]
+job_type = "agent"
+prompt = "Summarize the inbox"
+schedule = { kind = "cron", expr = "0 * * * *" }
+delivery = { mode = "announce", channel = "slack.default", to = "U123", unfurl_links = false }
+
+[cron.plain]
+job_type = "agent"
+prompt = "Say hello"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+delivery = { mode = "announce", channel = "slack.default", to = "U123" }
+        "#;
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            cron: std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
+        }
+        let parsed: Wrap = toml::from_str(toml_str).unwrap();
+
+        let digest_decl = parsed.cron["digest"].delivery.as_ref().unwrap();
+        assert_eq!(digest_decl.unfurl_links, Some(false));
+        assert_eq!(digest_decl.unfurl_media, None);
+        let plain_decl = parsed.cron["plain"].delivery.as_ref().unwrap();
+        assert_eq!(plain_decl.unfurl_links, None);
+        assert_eq!(plain_decl.unfurl_media, None);
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["digest", "plain"]);
+        let decls = decls_map(parsed.cron.clone().into_iter().collect());
+        config.cron = parsed.cron;
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let digest = get_job(&config, "digest").unwrap();
+        assert_eq!(
+            digest.delivery.unfurl(),
+            zeroclaw_api::channel::LinkUnfurl {
+                links: Some(false),
+                media: None,
+            }
+        );
+
+        let plain = get_job(&config, "plain").unwrap();
+        assert_eq!(
+            plain.delivery.unfurl(),
+            zeroclaw_api::channel::LinkUnfurl::default()
+        );
+        // Unset fields stay out of the stored delivery JSON, so a job that
+        // never sets them stores the same JSON an older binary wrote.
+        let stored = serde_json::to_string(&plain.delivery).unwrap();
+        assert!(!stored.contains("unfurl"), "stored delivery: {stored}");
+    }
+
+    #[test]
     fn skip_missed_run_advances_recurring_job_next_run() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -7319,6 +7384,8 @@ schedule = { kind = "every", every_ms = 300000 }
                     to: Some("111".to_string()),
                     thread_id: None,
                     best_effort: true,
+                    unfurl_links: None,
+                    unfurl_media: None,
                 }),
                 ..CronJobPatch::default()
             },

@@ -124,6 +124,14 @@ pub struct DeliveryConfig {
     pub thread_id: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    /// Slack `chat.postMessage` `unfurl_links` for this job's messages.
+    /// `None` leaves Slack's default; other channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfurl_links: Option<bool>,
+    /// Slack `chat.postMessage` `unfurl_media` for this job's messages.
+    /// `None` leaves Slack's default; other channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfurl_media: Option<bool>,
 }
 
 impl Default for DeliveryConfig {
@@ -134,6 +142,18 @@ impl Default for DeliveryConfig {
             to: None,
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
+        }
+    }
+}
+
+impl DeliveryConfig {
+    /// The link-preview choice to carry on each delivered message.
+    pub fn unfurl(&self) -> zeroclaw_api::channel::LinkUnfurl {
+        zeroclaw_api::channel::LinkUnfurl {
+            links: self.unfurl_links,
+            media: self.unfurl_media,
         }
     }
 }

@@ -5661,7 +5661,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn cron_api_run_records_best_effort_delivery_failure_as_degraded() {
         zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
+            |_config, channel, _target, _thread_id, _unfurl, _output| {
                 Box::pin(async move {
                     if channel == "fail-delivery" {
                         anyhow::bail!("synthetic delivery failure");
@@ -5695,6 +5695,8 @@ pub(crate) mod tests {
                 to: Some("123456".into()),
                 thread_id: None,
                 best_effort: true,
+                unfurl_links: None,
+                unfurl_media: None,
             }),
             true,
         )

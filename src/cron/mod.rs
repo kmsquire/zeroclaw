@@ -57,6 +57,8 @@ fn build_delivery(args: &crate::CronDeliveryArgs) -> Option<DeliveryConfig> {
         to: args.delivery_to.clone(),
         thread_id: args.delivery_thread.clone(),
         best_effort: args.best_effort_override().unwrap_or(true),
+        unfurl_links: None,
+        unfurl_media: None,
     })
 }
 
@@ -90,6 +92,8 @@ fn merge_delivery(
         to: args.delivery_to.clone().or(base.to),
         thread_id: args.delivery_thread.clone().or(base.thread_id),
         best_effort: args.best_effort_override().unwrap_or(base.best_effort),
+        unfurl_links: base.unfurl_links,
+        unfurl_media: base.unfurl_media,
     })
 }
 
@@ -749,6 +753,29 @@ mod tests {
         );
         assert!(message.contains("2026-05-18T09:00:00Z"));
         assert!(message.contains("2026-05-18T09:00:00-04:00"));
+    }
+
+    #[test]
+    fn cli_delivery_update_keeps_the_jobs_unfurl_choice() {
+        let existing = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some("slack.default".to_string()),
+            to: Some("U123".to_string()),
+            thread_id: None,
+            best_effort: true,
+            unfurl_links: Some(false),
+            unfurl_media: Some(true),
+        };
+        let args = crate::CronDeliveryArgs {
+            delivery_to: Some("U456".to_string()),
+            ..crate::CronDeliveryArgs::default()
+        };
+
+        let merged = merge_delivery(&existing, &args).expect("a delivery flag was set");
+
+        assert_eq!(merged.to.as_deref(), Some("U456"));
+        assert_eq!(merged.unfurl_links, Some(false));
+        assert_eq!(merged.unfurl_media, Some(true));
     }
 
     #[test]

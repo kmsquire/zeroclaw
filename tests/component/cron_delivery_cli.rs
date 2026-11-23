@@ -358,6 +358,8 @@ fn seed_declarative_job(config_dir: &Path) {
             to: Some("111".to_string()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         }),
         shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
     };

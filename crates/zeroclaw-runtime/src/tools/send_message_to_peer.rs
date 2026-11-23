@@ -428,7 +428,16 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
-        match deliver_announcement(&self.config, &channel, &target, None, &message).await {
+        match deliver_announcement(
+            &self.config,
+            &channel,
+            &target,
+            None,
+            zeroclaw_api::channel::LinkUnfurl::default(),
+            &message,
+        )
+        .await
+        {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("delivered to external peer {target:?} on {channel}").into(),

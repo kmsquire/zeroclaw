@@ -5346,6 +5346,41 @@ impl Config {
         }
     }
 
+    /// One warning per declared cron job that sets `delivery.unfurl_links` or
+    /// `delivery.unfurl_media` for a channel other than Slack. Only Slack reads
+    /// them, so the setting would have no effect, and saying so here reaches
+    /// the operator once instead of on every run.
+    fn collect_cron_unfurl_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        let mut ids: Vec<&String> = self.cron.keys().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let Some(delivery) = self.cron[id].delivery.as_ref() else {
+                continue;
+            };
+            if delivery.unfurl_links.is_none() && delivery.unfurl_media.is_none() {
+                continue;
+            }
+            let Some(channel) = delivery.channel.as_deref() else {
+                continue;
+            };
+            let channel_type = channel.split_once('.').map_or(channel, |(kind, _)| kind);
+            if channel_type.eq_ignore_ascii_case("slack") {
+                continue;
+            }
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "cron_delivery_unfurl_ignored",
+                format!(
+                    "cron job `{id}` sets unfurl_links or unfurl_media for channel `{channel}`; \
+                     only Slack reads them, so they have no effect there."
+                ),
+                format!("cron.{id}.delivery"),
+            ));
+        }
+    }
+
     /// Resolve the per-agent workspace directory for `alias`.
     ///
     /// Returns the agent's `[agents.<alias>.workspace.path]` override
@@ -16233,6 +16268,18 @@ pub struct DeliveryConfigDecl {
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    /// Slack only: whether Slack previews web pages linked in this job's
+    /// messages, sent as `chat.postMessage`'s `unfurl_links`. Unset leaves
+    /// Slack's default. Other channels ignore it, and validation warns when a
+    /// job sets it for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfurl_links: Option<bool>,
+    /// Slack only: whether Slack previews media linked in this job's
+    /// messages, sent as `chat.postMessage`'s `unfurl_media`. Unset leaves
+    /// Slack's default. Other channels ignore it, and validation warns when a
+    /// job sets it for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfurl_media: Option<bool>,
 }
 
 impl Default for DeliveryConfigDecl {
@@ -16243,6 +16290,8 @@ impl Default for DeliveryConfigDecl {
             to: None,
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         }
     }
 }
@@ -24142,6 +24191,7 @@ impl Config {
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
+        self.collect_cron_unfurl_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
         self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
@@ -43727,6 +43777,44 @@ group_policy = "disabled"
             "in-memory command must not leak past a wrong-kind bail; \
              got:\n{written}"
         );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_unfurl_on_a_non_slack_cron_delivery() {
+        let config: Config = toml::from_str(
+            r#"
+[cron.digest]
+job_type = "agent"
+prompt = "summarize"
+schedule = { kind = "cron", expr = "0 * * * *" }
+delivery = { mode = "announce", channel = "telegram.ops", to = "1", unfurl_links = false }
+
+[cron.slack-digest]
+job_type = "agent"
+prompt = "summarize"
+schedule = { kind = "cron", expr = "0 * * * *" }
+delivery = { mode = "announce", channel = "slack.default", to = "U1", unfurl_media = false }
+
+[cron.plain]
+job_type = "agent"
+prompt = "summarize"
+schedule = { kind = "cron", expr = "0 * * * *" }
+delivery = { mode = "announce", channel = "telegram.ops", to = "1" }
+"#,
+        )
+        .expect("cron decls parse");
+
+        let unfurl: Vec<_> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|w| w.code == "cron_delivery_unfurl_ignored")
+            .collect();
+        assert_eq!(
+            unfurl.len(),
+            1,
+            "only the telegram job that sets unfurl warns"
+        );
+        assert_eq!(unfurl[0].path, "cron.digest.delivery");
     }
 
     #[test]

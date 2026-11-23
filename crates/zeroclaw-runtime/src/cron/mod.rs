@@ -630,6 +630,8 @@ mod validate_delivery_tests {
             to: Some("user-42".into()),
             thread_id: Some("conv-99".into()),
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
         validate_delivery_config(Some(&delivery)).expect("webhook with thread_id must validate");
     }
@@ -642,6 +644,8 @@ mod validate_delivery_tests {
             to: Some("user-42".into()),
             thread_id: None,
             best_effort: true,
+            unfurl_links: None,
+            unfurl_media: None,
         };
         validate_delivery_config(Some(&delivery)).expect("webhook without thread_id must validate");
     }

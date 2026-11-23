@@ -115,6 +115,26 @@ retry.
 - `use_markdown_blocks`: render replies with Slack Block Kit formatting for
   richer layout. Turn off for plain text.
 
+## Link previews
+
+Slack previews links in messages that apps post, unless the post says
+otherwise. A cron job that delivers to Slack can say otherwise for its own
+messages, with `unfurl_links` and `unfurl_media` on its `delivery` table. They
+become `chat.postMessage`'s fields of the same names:
+
+```toml
+[cron.inbox-digest]
+job_type = "agent"
+prompt = "Summarize new mail"
+schedule = { kind = "cron", expr = "0 * * * *" }
+delivery = { mode = "announce", channel = "slack.default", to = "U123", unfurl_links = false }
+```
+
+`unfurl_links = false` stops previews of web pages; images and video linked in
+the message still preview unless `unfurl_media = false` is set too. Leave a
+field out to keep Slack's default. Other channels ignore both fields, and
+config validation warns when a job sets them for one.
+
 ## Messages from other apps
 
 Slack delivers Workflow Builder steps and other app posts as
