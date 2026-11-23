@@ -5159,6 +5159,18 @@ impl SlackChannel {
     }
 }
 
+/// Set `chat.postMessage`'s `unfurl_links` and `unfurl_media` from the
+/// message's choice, leaving out each one that is unset so Slack's own
+/// default applies.
+fn apply_unfurl(body: &mut serde_json::Value, unfurl: zeroclaw_api::channel::LinkUnfurl) {
+    if let Some(links) = unfurl.links {
+        body["unfurl_links"] = serde_json::Value::Bool(links);
+    }
+    if let Some(media) = unfurl.media {
+        body["unfurl_media"] = serde_json::Value::Bool(media);
+    }
+}
+
 /// `chat.postMessage` body for a Socket Mode approval card.
 ///
 /// Split out from the send so the rendered card can be asserted directly.
@@ -5297,7 +5309,7 @@ impl Channel for SlackChannel {
         let mut outbound_attachments = message.attachments.clone();
 
         // Detect Block Kit payloads produced by the `/config` command.
-        let body = if let Some(blocks_json) =
+        let mut body = if let Some(blocks_json) =
             message.content.strip_prefix(crate::util::BLOCK_KIT_PREFIX)
         {
             let blocks: serde_json::Value = serde_json::from_str(blocks_json)
@@ -5374,6 +5386,7 @@ impl Channel for SlackChannel {
             }
             body
         };
+        apply_unfurl(&mut body, message.unfurl);
 
         let resp = self
             .http_client()
@@ -7542,6 +7555,89 @@ mod tests {
         )
         .with_workspace_dir(workspace.to_path_buf())
         .with_api_base_url(server.uri())
+    }
+
+    /// Send `msg` through a mock Slack and return the `chat.postMessage` body.
+    async fn posted_message_body(msg: &SendMessage) -> serde_json::Value {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "ts": "1710000000.000100",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = test_slack_channel(&server, tmp.path());
+        SlackChannel::send(&ch, msg).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|req| req.url.path() == "/chat.postMessage")
+            .expect("chat.postMessage should be called");
+        serde_json::from_slice(&post.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_passes_set_unfurl_fields_to_chat_post_message() {
+        let msg = SendMessage::new("See https://example.com/page", "C123").with_unfurl(
+            zeroclaw_api::channel::LinkUnfurl {
+                links: Some(false),
+                media: Some(true),
+            },
+        );
+
+        let body = posted_message_body(&msg).await;
+
+        assert_eq!(body["unfurl_links"], serde_json::Value::Bool(false));
+        assert_eq!(body["unfurl_media"], serde_json::Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn send_omits_unset_unfurl_fields_from_chat_post_message() {
+        let msg = SendMessage::new("See https://example.com/page", "C123").with_unfurl(
+            zeroclaw_api::channel::LinkUnfurl {
+                links: None,
+                media: Some(false),
+            },
+        );
+        let body = posted_message_body(&msg).await;
+        assert!(body.get("unfurl_links").is_none(), "body: {body}");
+        assert_eq!(body["unfurl_media"], serde_json::Value::Bool(false));
+
+        let body =
+            posted_message_body(&SendMessage::new("See https://example.com/page", "C123")).await;
+        assert_eq!(body["text"], "See https://example.com/page");
+        assert!(body.get("unfurl_links").is_none(), "body: {body}");
+        assert!(body.get("unfurl_media").is_none(), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn send_passes_unfurl_fields_with_block_kit_payload() {
+        let msg = SendMessage::new(
+            format!(
+                "{}[{{\"type\":\"section\",\"text\":{{\"type\":\"mrkdwn\",\"text\":\"hi\"}}}}]",
+                crate::util::BLOCK_KIT_PREFIX
+            ),
+            "C123",
+        )
+        .with_unfurl(zeroclaw_api::channel::LinkUnfurl {
+            links: Some(false),
+            media: None,
+        });
+
+        let body = posted_message_body(&msg).await;
+
+        assert_eq!(body["blocks"][0]["type"], "section");
+        assert_eq!(body["unfurl_links"], serde_json::Value::Bool(false));
+        assert!(body.get("unfurl_media").is_none(), "body: {body}");
     }
 
     #[tokio::test]

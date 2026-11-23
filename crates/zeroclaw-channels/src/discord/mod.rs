@@ -4912,6 +4912,7 @@ mod tests {
             references: Vec::new(),
             force_voice: false,
             suppress_voice: false,
+            unfurl: Default::default(),
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));

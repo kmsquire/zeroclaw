@@ -474,6 +474,22 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+    /// Link-preview choice for this message. Only Slack's `send` reads it;
+    /// other channels, and Slack's streaming drafts, ignore it.
+    pub unfurl: LinkUnfurl,
+}
+
+/// Whether the platform should generate link and media previews for one
+/// outbound message, mirroring Slack's `unfurl_links` and `unfurl_media`.
+///
+/// `None` leaves the platform's own default in place, so a channel sends
+/// nothing for an unset field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkUnfurl {
+    /// Previews of linked web pages.
+    pub links: Option<bool>,
+    /// Previews of linked media, such as images and video.
+    pub media: Option<bool>,
 }
 
 /// What happens when someone votes on a poll this channel posted.
@@ -659,6 +675,7 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            unfurl: LinkUnfurl::default(),
         }
     }
 
@@ -691,6 +708,7 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            unfurl: LinkUnfurl::default(),
         }
     }
 
@@ -721,6 +739,12 @@ impl SendMessage {
     /// Attach files to this message.
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Set the link-preview choice for this message.
+    pub fn with_unfurl(mut self, unfurl: LinkUnfurl) -> Self {
+        self.unfurl = unfurl;
         self
     }
 }
