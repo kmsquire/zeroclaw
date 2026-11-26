@@ -28,7 +28,7 @@ pub(crate) async fn gate_tool_approval(
 ) -> ApprovalGateOutcome {
     let mut approval_requirement = ctx
         .approval
-        .map(|mgr| mgr.approval_requirement(tool_name))
+        .map(|mgr| mgr.approval_requirement_for_call(tool_name, tool_args))
         .unwrap_or(ApprovalRequirement::NotRequired);
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
@@ -661,6 +661,61 @@ mod tests {
             requests.load(Ordering::SeqCst),
             1,
             "uncovered Full tool must not prompt the back-channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn listed_web_fetch_host_skips_the_card_and_unlisted_still_asks() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            always_ask: vec!["web_fetch".into()],
+            auto_approve_web_fetch_hosts: vec!["docs.rs".into()],
+            ..RiskProfileConfig::default()
+        };
+        let approval = ApprovalManager::for_non_interactive_backchannel(&profile);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel {
+            approval_requests: Arc::clone(&requests),
+        };
+        let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
+        let position = zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 };
+
+        let listed = gate_tool_approval(
+            &ctx,
+            "web_fetch",
+            &serde_json::json!({"url": "https://docs.rs/serde"}),
+            0,
+            position,
+        )
+        .await;
+        assert!(
+            matches!(listed, ApprovalGateOutcome::Proceed { approved: true }),
+            "a listed host must proceed approved"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "a listed host must not post a card"
+        );
+
+        let unlisted = gate_tool_approval(
+            &ctx,
+            "web_fetch",
+            &serde_json::json!({"url": "https://attacker.example/?d=docs.rs"}),
+            0,
+            position,
+        )
+        .await;
+        assert!(
+            matches!(unlisted, ApprovalGateOutcome::Proceed { approved: true }),
+            "the approving channel's answer must let the unlisted fetch proceed"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "an unlisted host must post a card"
         );
     }
 

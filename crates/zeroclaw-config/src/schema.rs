@@ -15007,6 +15007,14 @@ pub struct RiskProfileConfig {
     pub auto_approve: Vec<String>,
     /// Tools that always require approval in this profile.
     pub always_ask: Vec<String>,
+    /// Hosts a `web_fetch` reaches over `https` without an approval prompt,
+    /// even when `web_fetch` is in `always_ask`. Exact hosts in the strict
+    /// egress grammar: no `*`, no `*.` suffix, no scheme, path or port. A
+    /// fetch to any other host, over plain `http`, or to a listed host on an
+    /// explicit port, keeps the profile's usual approval. Refused while
+    /// `[web_fetch.firecrawl]` is enabled. Empty (the default) changes
+    /// nothing.
+    pub auto_approve_web_fetch_hosts: Vec<String>,
     /// Extra directory roots the agent may access.
     #[serde(alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
@@ -15091,6 +15099,7 @@ impl Default for RiskProfileConfig {
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
+            auto_approve_web_fetch_hosts: Vec::new(),
             allowed_roots: Vec::new(),
             delegation_policy: DelegationPolicy::default(),
             approval_route: None,
@@ -25422,6 +25431,32 @@ impl Config {
                     "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
                 );
             }
+            // Each entry skips a prompt, so each must name one host exactly:
+            // the strict egress grammar refuses `*`, URLs, ports and
+            // non-canonical spellings, and a suffix pattern is refused here.
+            for (i, host) in profile.auto_approve_web_fetch_hosts.iter().enumerate() {
+                let canonical = match zeroclaw_infra::net_guard::normalize_egress_pattern(host) {
+                    Ok(canonical) => canonical,
+                    Err(reason) => anyhow::bail!(
+                        "risk_profiles.{profile_alias}.auto_approve_web_fetch_hosts[{i}] ({host}) is invalid: {reason}"
+                    ),
+                };
+                if canonical.starts_with("*.") {
+                    anyhow::bail!(
+                        "risk_profiles.{profile_alias}.auto_approve_web_fetch_hosts[{i}] ({host}) is a suffix pattern; list each host exactly"
+                    );
+                }
+            }
+            // The Firecrawl fallback sends the whole URL to its API, which
+            // renders the page without the fetch's same-host redirect rule,
+            // so a listed host would no longer bound where an approved URL
+            // goes.
+            if self.web_fetch.firecrawl.enabled && !profile.auto_approve_web_fetch_hosts.is_empty()
+            {
+                anyhow::bail!(
+                    "risk_profiles.{profile_alias}.auto_approve_web_fetch_hosts cannot be combined with web_fetch.firecrawl.enabled: the fallback sends approved URLs to the Firecrawl API"
+                );
+            }
         }
 
         // Inbound authentication & principals (RFC 7141): one auth-specific
@@ -35595,6 +35630,80 @@ allowed_tools = ["shell"]
                 .contains("risk_profiles.default.deny_all_tools"),
             "error must name the offending path, got: {err}"
         );
+    }
+
+    #[test]
+    async fn risk_profile_auto_approve_web_fetch_hosts_accepts_exact_hosts() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+always_ask = ["web_fetch"]
+auto_approve_web_fetch_hosts = ["docs.rs", "en.wikipedia.org"]
+"#;
+        let parsed = parse_test_config(raw);
+        parsed.validate().expect("exact hosts must validate");
+        assert_eq!(
+            parsed.risk_profiles["default"].auto_approve_web_fetch_hosts,
+            vec!["docs.rs".to_string(), "en.wikipedia.org".to_string()]
+        );
+    }
+
+    #[test]
+    async fn risk_profile_auto_approve_web_fetch_hosts_refuses_firecrawl() {
+        let with = |firecrawl: bool, hosts: &str| {
+            parse_test_config(&format!(
+                r#"
+default_temperature = 0.7
+
+[web_fetch.firecrawl]
+enabled = {firecrawl}
+
+[risk_profiles.default]
+auto_approve_web_fetch_hosts = [{hosts}]
+"#
+            ))
+        };
+        let err = with(true, "\"docs.rs\"").validate().unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "auto_approve_web_fetch_hosts cannot be combined with web_fetch.firecrawl.enabled"
+            ),
+            "{err}"
+        );
+        with(false, "\"docs.rs\"")
+            .validate()
+            .expect("no fallback, no conflict");
+        with(true, "").validate().expect("no list, no conflict");
+    }
+
+    #[test]
+    async fn risk_profile_auto_approve_web_fetch_hosts_rejects_all_but_exact_hosts() {
+        for entry in [
+            "*",
+            "*.docs.rs",
+            "https://docs.rs",
+            "docs.rs/serde",
+            "docs.rs:443",
+            "Docs.rs",
+            "docs.rs.",
+            "user@docs.rs",
+            " docs.rs",
+            "",
+        ] {
+            let raw = format!(
+                "default_temperature = 0.7\n\n[risk_profiles.default]\nauto_approve_web_fetch_hosts = [{entry:?}]\n"
+            );
+            let parsed = parse_test_config(&raw);
+            let err = parsed
+                .validate()
+                .expect_err(&format!("{entry:?} must be rejected"));
+            assert!(
+                err.to_string()
+                    .contains("risk_profiles.default.auto_approve_web_fetch_hosts[0]"),
+                "{entry:?}: error must name the offending path, got: {err}"
+            );
+        }
     }
 
     /// When no risk_profiles section is provided, defaults are applied to the
