@@ -2902,7 +2902,7 @@ fn all_tools_with_runtime_on_thread(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
-            web_fetch_config.firecrawl.clone(),
+            web_fetch_firecrawl(&web_fetch_config.firecrawl, root_config),
             web_fetch_config.allowed_private_hosts.clone(),
             root_config.security.nat64_prefixes.clone(),
         ) {
@@ -4140,6 +4140,32 @@ fn register_plugin_tools(
     );
 }
 
+/// The Firecrawl fallback `web_fetch` is built with: off while any risk
+/// profile lists `auto_approve_web_fetch_hosts`. The fallback sends the whole
+/// URL to Firecrawl's API, which follows redirects anywhere, so a listed host
+/// would no longer bound where an approved URL goes. Validation refuses the
+/// combination too, but the daemon boots past a failed validation.
+fn web_fetch_firecrawl(
+    firecrawl: &zeroclaw_config::schema::FirecrawlConfig,
+    root_config: &zeroclaw_config::schema::Config,
+) -> zeroclaw_config::schema::FirecrawlConfig {
+    let mut firecrawl = firecrawl.clone();
+    let lists_hosts = root_config
+        .risk_profiles
+        .values()
+        .any(|profile| !profile.auto_approve_web_fetch_hosts.is_empty());
+    if firecrawl.enabled && lists_hosts {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "web_fetch: Firecrawl fallback disabled because a risk profile sets auto_approve_web_fetch_hosts"
+        );
+        firecrawl.enabled = false;
+    }
+    firecrawl
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4148,6 +4174,25 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
         MemoryConfig, SopApprovalConfig,
     };
+
+    #[test]
+    fn web_fetch_firecrawl_is_off_while_a_profile_lists_hosts() {
+        let firecrawl = zeroclaw_config::schema::FirecrawlConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        assert!(
+            web_fetch_firecrawl(&firecrawl, &config).enabled,
+            "no listed hosts: Firecrawl stays as configured"
+        );
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .auto_approve_web_fetch_hosts = vec!["docs.rs".into()];
+        assert!(!web_fetch_firecrawl(&firecrawl, &config).enabled);
+    }
 
     #[test]
     fn git_write_boundary_rejects_docker_runtime_writes() {

@@ -86,6 +86,10 @@ pub struct ApprovalManager {
     auto_approve: HashSet<String>,
     /// Tools that always need approval, ignoring session allowlist.
     always_ask: HashSet<String>,
+    /// Hosts a `web_fetch` reaches without a prompt, from config. Validation
+    /// refuses anything but exact hosts, but the daemon boots past a failed
+    /// validation, so they are compared by plain equality.
+    auto_approve_web_fetch_hosts: Vec<String>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
     /// When `true`, tools that would require interactive approval are
@@ -118,6 +122,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            auto_approve_web_fetch_hosts: risk_profile.auto_approve_web_fetch_hosts.clone(),
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
@@ -131,6 +136,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            auto_approve_web_fetch_hosts: risk_profile.auto_approve_web_fetch_hosts.clone(),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
@@ -155,6 +161,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            auto_approve_web_fetch_hosts: risk_profile.auto_approve_web_fetch_hosts.clone(),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
@@ -178,6 +185,7 @@ impl ApprovalManager {
         Self {
             auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
             always_ask: normalized_always_ask(&risk_profile.always_ask),
+            auto_approve_web_fetch_hosts: risk_profile.auto_approve_web_fetch_hosts.clone(),
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
@@ -195,6 +203,7 @@ impl ApprovalManager {
         Self {
             auto_approve: self.auto_approve.clone(),
             always_ask: self.always_ask.clone(),
+            auto_approve_web_fetch_hosts: self.auto_approve_web_fetch_hosts.clone(),
             autonomy_level: self.autonomy_level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
@@ -273,6 +282,66 @@ impl ApprovalManager {
 
         // Default: supervised mode requires approval.
         ApprovalRequirement::Prompt
+    }
+
+    /// The approval requirement for one call, given its arguments.
+    ///
+    /// Everything is [`Self::approval_requirement`], except that a `web_fetch`
+    /// that would prompt is approved when its URL is `https`, names no
+    /// explicit port, and its host is in the profile's
+    /// `auto_approve_web_fetch_hosts`. This runs ahead of `always_ask`, so a
+    /// profile can keep `web_fetch` there and still skip the prompt for the
+    /// hosts it lists.
+    pub fn approval_requirement_for_call(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> ApprovalRequirement {
+        let requirement = self.approval_requirement(tool_name);
+        if requirement == ApprovalRequirement::Prompt
+            && tool_name == "web_fetch"
+            && self.web_fetch_host_is_listed(args)
+        {
+            return ApprovalRequirement::Approved;
+        }
+        requirement
+    }
+
+    fn web_fetch_host_is_listed(&self, args: &serde_json::Value) -> bool {
+        if self.auto_approve_web_fetch_hosts.is_empty() {
+            return false;
+        }
+        let Some(raw_url) = args.get("url").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Ok(host) = zeroclaw_tools::web_fetch::request_host(raw_url) else {
+            return false;
+        };
+        // Plain `http` would show the URL, query string included, to the
+        // network path. `Url::port` is `None` for the scheme's default port,
+        // so only a port the URL spells out keeps the prompt.
+        let Ok(url) = reqwest::Url::parse(raw_url.trim()) else {
+            return false;
+        };
+        if url.scheme() != "https" || url.port().is_some() {
+            return false;
+        }
+        // Plain equality with the canonical host, never pattern matching: the
+        // daemon boots past a config that fails validation, so an entry
+        // validation refuses (`*`, a `*.` suffix, a non-canonical spelling)
+        // can reach here, and it must match nothing.
+        let listed = self.auto_approve_web_fetch_hosts.contains(&host);
+        if listed {
+            // The host only: the URL's query string can carry what was fetched for.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(::serde_json::json!({"tool_name": "web_fetch", "host": host})),
+                "approval: web_fetch approved without a prompt; host is in auto_approve_web_fetch_hosts"
+            );
+        }
+        listed
     }
 
     /// Whether an approval channel that explicitly reports no approval support
@@ -844,6 +913,199 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert!(!log[0].timestamp.is_empty());
         assert_eq!(log[0].channel, "telegram");
+    }
+
+    // ── auto_approve_web_fetch_hosts ─────────────────────────
+
+    fn listed_hosts_config() -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: vec![],
+            always_ask: vec!["web_fetch".into(), "http_request".into()],
+            auto_approve_web_fetch_hosts: vec!["docs.rs".into(), "en.wikipedia.org".into()],
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    fn fetch(url: &str) -> serde_json::Value {
+        serde_json::json!({ "url": url })
+    }
+
+    #[test]
+    fn listed_web_fetch_host_is_approved_ahead_of_always_ask() {
+        for mgr in [
+            ApprovalManager::from_risk_profile(&listed_hosts_config()),
+            ApprovalManager::for_non_interactive_backchannel(&listed_hosts_config()),
+        ] {
+            assert_eq!(
+                mgr.approval_requirement_for_call("web_fetch", &fetch("https://docs.rs/serde")),
+                ApprovalRequirement::Approved
+            );
+            assert_eq!(
+                mgr.approval_requirement_for_call(
+                    "web_fetch",
+                    &fetch("https://en.wikipedia.org/wiki/Heron?action=raw")
+                ),
+                ApprovalRequirement::Approved
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_web_fetch_host_still_prompts() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&listed_hosts_config());
+        assert_eq!(
+            mgr.approval_requirement_for_call(
+                "web_fetch",
+                &fetch("https://attacker.example/verify?t=docs.rs")
+            ),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn always_on_an_unlisted_fetch_does_not_cover_the_next_one() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&listed_hosts_config());
+        let first = fetch("https://one.example/");
+        mgr.record_decision("web_fetch", &first, &ApprovalResponse::Always, "channel");
+        assert_eq!(
+            mgr.approval_requirement_for_call("web_fetch", &fetch("https://two.example/?q=x")),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn web_fetch_host_is_read_the_way_the_tool_reads_it() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&listed_hosts_config());
+        let cases = [
+            ("https://DOCS.RS/serde", ApprovalRequirement::Approved),
+            ("https://docs.rs./serde", ApprovalRequirement::Approved),
+            ("  https://docs.rs/serde  ", ApprovalRequirement::Approved),
+            ("https://docs.rs:443/serde", ApprovalRequirement::Approved),
+            ("HTTPS://docs.rs/serde", ApprovalRequirement::Prompt),
+            ("http://docs.rs/serde", ApprovalRequirement::Prompt),
+            ("http://docs.rs:443/serde", ApprovalRequirement::Prompt),
+            ("https://docs.rs:8443/serde", ApprovalRequirement::Prompt),
+            ("https://evil.docs.rs/", ApprovalRequirement::Prompt),
+            ("https://docs.rs.evil.example/", ApprovalRequirement::Prompt),
+            ("https://docs.rs@evil.example/", ApprovalRequirement::Prompt),
+            ("https://user@docs.rs/", ApprovalRequirement::Prompt),
+            ("https://docs.rs/a b", ApprovalRequirement::Prompt),
+            ("ftp://docs.rs/", ApprovalRequirement::Prompt),
+            ("docs.rs/serde", ApprovalRequirement::Prompt),
+            ("", ApprovalRequirement::Prompt),
+        ];
+        for (url, want) in cases {
+            assert_eq!(
+                mgr.approval_requirement_for_call("web_fetch", &fetch(url)),
+                want,
+                "{url:?}"
+            );
+        }
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({ "url": 7 }),
+            serde_json::json!("https://docs.rs/"),
+        ] {
+            assert_eq!(
+                mgr.approval_requirement_for_call("web_fetch", &args),
+                ApprovalRequirement::Prompt,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn entries_validation_refuses_approve_nothing() {
+        // The daemon boots past a config that fails validation, so these can
+        // reach the manager. Each must leave every fetch prompting.
+        let config = RiskProfileConfig {
+            auto_approve_web_fetch_hosts: vec![
+                "*".into(),
+                "*.docs.rs".into(),
+                "Docs.rs".into(),
+                "docs.rs.".into(),
+                "docs.rs:443".into(),
+                "https://en.wikipedia.org".into(),
+            ],
+            ..listed_hosts_config()
+        };
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&config);
+        for url in [
+            "https://docs.rs/serde",
+            "https://api.docs.rs/",
+            "https://en.wikipedia.org/wiki/Heron",
+            "https://attacker.example/",
+        ] {
+            assert_eq!(
+                mgr.approval_requirement_for_call("web_fetch", &fetch(url)),
+                ApprovalRequirement::Prompt,
+                "{url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_hosts_approve_only_web_fetch() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&listed_hosts_config());
+        let to_listed = fetch("https://docs.rs/serde");
+        assert_eq!(
+            mgr.approval_requirement_for_call("http_request", &to_listed),
+            ApprovalRequirement::Prompt
+        );
+        assert_eq!(
+            mgr.approval_requirement_for_call("browser", &to_listed),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn a_profile_without_listed_hosts_prompts_as_before() {
+        let config = RiskProfileConfig {
+            auto_approve_web_fetch_hosts: vec![],
+            ..listed_hosts_config()
+        };
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&config);
+        assert_eq!(
+            mgr.approval_requirement_for_call("web_fetch", &fetch("https://docs.rs/serde")),
+            ApprovalRequirement::Prompt
+        );
+    }
+
+    #[test]
+    fn listed_hosts_never_tighten_a_call_that_would_not_prompt() {
+        let read_only = RiskProfileConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..listed_hosts_config()
+        };
+        let mgr = ApprovalManager::from_risk_profile(&read_only);
+        assert_eq!(
+            mgr.approval_requirement_for_call("web_fetch", &fetch("https://docs.rs/serde")),
+            ApprovalRequirement::NotRequired
+        );
+        let mgr = ApprovalManager::from_risk_profile(&listed_hosts_config());
+        assert_eq!(
+            mgr.approval_requirement_for_call("file_read", &serde_json::json!({"path": "a"})),
+            mgr.approval_requirement("file_read")
+        );
+    }
+
+    #[test]
+    fn derived_and_fresh_turn_managers_keep_the_listed_hosts() {
+        let parent = ApprovalManager::for_non_interactive_backchannel(&supervised_config());
+        let derived = parent.derive_for_risk_profile(&listed_hosts_config());
+        let fresh = derived.for_new_turn();
+        for mgr in [&derived, &fresh] {
+            assert_eq!(
+                mgr.approval_requirement_for_call("web_fetch", &fetch("https://docs.rs/")),
+                ApprovalRequirement::Approved
+            );
+        }
+        let child = ApprovalManager::for_bounded_non_interactive(&listed_hosts_config());
+        assert_eq!(
+            child.approval_requirement_for_call("web_fetch", &fetch("https://docs.rs/")),
+            ApprovalRequirement::Approved
+        );
     }
 
     // ── summarize_args ───────────────────────────────────────

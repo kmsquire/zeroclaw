@@ -163,8 +163,15 @@ impl WebFetchTool {
                 return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
             }
 
+            // reqwest lists every URL already requested, the first one included,
+            // so the last is the hop this redirect leaves.
+            let Some(from) = attempt.previous().last().cloned() else {
+                rejected_by_policy.store(true, Ordering::Relaxed);
+                return attempt.error(std::io::Error::other("Redirect with no previous URL"));
+            };
             if let Err(err) = validate_redirect_target(
                 attempt.url().as_str(),
+                &from,
                 &pinned_host,
                 &allowed_domains,
                 &blocked_domains,
@@ -642,6 +649,7 @@ fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
 
 fn validate_redirect_target(
     raw_url: &str,
+    from: &reqwest::Url,
     pinned_host: &str,
     allowed_domains: &[String],
     blocked_domains: &[String],
@@ -651,6 +659,16 @@ fn validate_redirect_target(
         .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
     if redirect_url.host_str() != Some(pinned_host) {
         anyhow::bail!("Cross-host redirects are blocked so DNS validation remains pinned");
+    }
+    // The approval gate passes a listed host only over https on the default
+    // port, so a hop may not undo either: plain http would show the query
+    // string to the network path. `Url::port` is `None` for the scheme's
+    // default port, so an http-to-https upgrade on default ports still follows.
+    if from.scheme() == "https" && redirect_url.scheme() != "https" {
+        anyhow::bail!("Redirects from https to http are blocked");
+    }
+    if redirect_url.port() != from.port() {
+        anyhow::bail!("Redirects that change the port are blocked");
     }
 
     validate_target_url_with_dns_check(
@@ -709,18 +727,9 @@ fn validate_target_url_with_dns_check(
     validate_dns: impl FnOnce(&str, bool) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
     let url = raw_url.trim();
-
-    if url.is_empty() {
-        anyhow::bail!("URL cannot be empty");
-    }
-
-    if url.chars().any(char::is_whitespace) {
-        anyhow::bail!("URL cannot contain whitespace");
-    }
-
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        anyhow::bail!("Only http:// and https:// URLs are allowed");
-    }
+    // The approval gate reads the host through `request_host` too, so the
+    // host it approves is the host checked and connected to here.
+    let host = request_host(url)?;
 
     if allowed_domains.is_empty() {
         anyhow::bail!(
@@ -728,8 +737,6 @@ fn validate_target_url_with_dns_check(
              Add [{tool_name}].allowed_domains in config.toml"
         );
     }
-
-    let host = extract_host(url)?;
 
     // blocked_domains always takes precedence
     if domain_guard::host_matches_allowlist(&host, blocked_domains) {
@@ -775,6 +782,24 @@ fn validate_target_url_with_dns_check(
     validate_dns(&host, private_tolerated)?;
 
     Ok(url.to_string())
+}
+
+/// The host a `web_fetch` of `raw_url` is checked against and connects to,
+/// or an error where the tool refuses the URL before resolving it. The
+/// approval gate reads the host through this, so the host it approves is the
+/// host the tool fetches.
+pub fn request_host(raw_url: &str) -> anyhow::Result<String> {
+    let url = raw_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("URL cannot be empty");
+    }
+    if url.chars().any(char::is_whitespace) {
+        anyhow::bail!("URL cannot contain whitespace");
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
+    }
+    extract_host(url)
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -1186,6 +1211,7 @@ mod tests {
         let allowed = vec!["*".to_string()];
         let err = validate_redirect_target(
             "https://other.example/page",
+            &reqwest::Url::parse("https://initial.example/start").unwrap(),
             "initial.example",
             &allowed,
             &[],
@@ -1204,6 +1230,7 @@ mod tests {
         let allowed = vec!["*".to_string()];
         let err = validate_redirect_target(
             "https://initial.example./page",
+            &reqwest::Url::parse("https://initial.example/start").unwrap(),
             "initial.example",
             &allowed,
             &[],
@@ -1216,6 +1243,53 @@ mod tests {
             err.contains("Cross-host redirects"),
             "unexpected error: {err}"
         );
+    }
+
+    fn redirect_from(from: &str, to: &str) -> anyhow::Result<()> {
+        validate_redirect_target(
+            to,
+            &reqwest::Url::parse(from).unwrap(),
+            "initial.example",
+            &["*".to_string()],
+            &[],
+            &[],
+        )
+    }
+
+    #[test]
+    fn redirect_refuses_https_to_http_on_the_same_host() {
+        let err = redirect_from("https://initial.example/a", "http://initial.example/a?q=1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https to http"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn redirect_refuses_a_port_change_on_the_same_host() {
+        for (from, to) in [
+            (
+                "https://initial.example/a",
+                "https://initial.example:8443/a",
+            ),
+            (
+                "https://initial.example:8443/a",
+                "https://initial.example/a",
+            ),
+        ] {
+            let err = redirect_from(from, to).unwrap_err().to_string();
+            assert!(err.contains("change the port"), "{from} -> {to}: {err}");
+        }
+    }
+
+    #[test]
+    fn redirect_follows_same_scheme_and_port_and_an_https_upgrade() {
+        for (from, to) in [
+            ("https://initial.example/a", "https://initial.example/b"),
+            ("https://initial.example/a", "https://initial.example:443/b"),
+            ("http://initial.example/a", "https://initial.example/b"),
+        ] {
+            redirect_from(from, to).unwrap_or_else(|e| panic!("{from} -> {to}: {e}"));
+        }
     }
 
     #[test]
@@ -1259,6 +1333,62 @@ mod tests {
     fn extract_host_rejects_bracketed_ipv6_with_policy_error() {
         let err = extract_host("http://[::1]/").unwrap_err().to_string();
         assert_eq!(err, "IPv6 hosts are not supported in web_fetch");
+    }
+
+    #[test]
+    fn request_host_is_the_host_the_fetch_validates() {
+        let cases = [
+            ("https://DOCS.RS/serde", "docs.rs"),
+            ("https://docs.rs./serde", "docs.rs"),
+            ("  https://docs.rs/serde  ", "docs.rs"),
+            ("https://docs.rs:8443/x", "docs.rs"),
+            ("https://exämple.com/", "xn--exmple-cua.com"),
+        ];
+        for (url, want) in cases {
+            assert_eq!(request_host(url).unwrap(), want, "{url:?}");
+            let mut validated = None;
+            validate_target_url_with_dns_check(
+                url,
+                &["*".into()],
+                &[],
+                &[],
+                "web_fetch",
+                |h, _| {
+                    validated = Some(h.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(validated.as_deref(), Some(want), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn request_host_refuses_what_the_fetch_refuses() {
+        for url in [
+            "",
+            "https://docs.rs/a b",
+            "ftp://docs.rs/",
+            "docs.rs/serde",
+            "https://user@docs.rs/",
+            "https://user:pw@docs.rs/",
+            "https://docs.rs@evil.example/",
+            "http://[::1]/",
+        ] {
+            assert!(request_host(url).is_err(), "{url:?}");
+            assert!(
+                validate_target_url_with_dns_check(
+                    url,
+                    &["*".into()],
+                    &[],
+                    &[],
+                    "web_fetch",
+                    |_, _| Ok(())
+                )
+                .is_err(),
+                "{url:?}"
+            );
+        }
     }
 
     #[test]
